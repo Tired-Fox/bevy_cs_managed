@@ -1,10 +1,10 @@
 [package]
-name = "scripting"
+name = "bevy_cs_managed"
 version = "0.0.0"
 edition = "2024"
 
 [features]
-download-runtime = ["dep:reqwest"]
+download-runtime = ["dep:ureq"]
 
 [profile.dev]
 opt-level = 1
@@ -29,7 +29,7 @@ bevy = "0.17.2"
 dirs = "6.0.0"
 log = "0.4.28"
 regex = "1.12.2"
-reqwest = { version = "0.12.24", optional = true, features = ["blocking"] }
+ureq = { version = "3.1.2", optional = true }
 
 # Dotnet bootstrap
 coreclr-hosting-shared = { version = "0.1.4", default-features = false }

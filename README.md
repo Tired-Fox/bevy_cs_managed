@@ -32,6 +32,7 @@ mobile and web, or making it compatible with [Mono](https://www.mono-project.com
     - [x] loading dll
     - [ ] searching and validating types
     - [ ] fetching and calling methods
+    - [ ] Error return values
     - [ ] Optimal memory management.
         - Is `GCHandle.Alloc` with `GCHandle.Free` on `Drop` good enough?
         - Is it better to find a way to make the data returned raw pointers which can be pinned with the runtime api similar to Mono?

@@ -95,7 +95,7 @@ unsafe impl Sync for Hostfxr {}
 
 impl Hostfxr {
     pub fn new(paths: &RuntimePaths) -> Self {
-        log::debug!("[C# Runtime] initializing hostfxr");
+        log::debug!("initializing hostfxr");
 
         let hostfxr_library = unsafe {
             Container::<HostfxrLibrary>::load(&paths.hostfxr)
@@ -217,7 +217,6 @@ enum Level {
 }
 
 struct Diagnostic {
-    pub source: PathBuf,
     pub file: PathBuf,
     pub line: usize,
     pub column: usize,
@@ -288,7 +287,7 @@ impl Runtime {
             net: net_version,
         };
 
-        log::debug!("[C# Runtime] Versions:");
+        log::debug!("Versions:");
         log::debug!("    net: {}", versions.net);
         log::debug!("    framework: {}", versions.framework);
 
@@ -312,7 +311,7 @@ impl Runtime {
             }),
         };
 
-        log::debug!("[C# Runtime] Paths:");
+        log::debug!("Paths:");
         log::debug!("    dotnet: {}", paths.dotnet.display());
         log::debug!("    hostfxr: {}", paths.hostfxr.display());
         log::debug!("    config: {}", paths.config.display());
@@ -320,7 +319,7 @@ impl Runtime {
 
         // TODO: Research whether this can be done once when packaging for
         //  production (Release)
-        #[cfg(all(debug_assertions, feature = "download-runtime"))]
+        #[cfg(debug_assertions)]
         Self::ensure_runtime(exe_dir, &versions, &paths);
 
         let host = Hostfxr::new(&paths);
@@ -353,6 +352,7 @@ impl Runtime {
             .join("Release")
             .join(&versions.net)
             .join("Runtime.dll");
+        let runtime_cs = runtime_dir.join("Runtime.cs");
 
         if !runtime_dll_bin.exists()
             || !runtimeconfig_bin.exists()
@@ -364,27 +364,32 @@ impl Runtime {
                     &versions.framework
                 ))
         {
-            // use std::process::Stdio;
-
             if !runtime_dir.exists() {
                 std::fs::create_dir_all(&runtime_dir).unwrap();
             }
+
             std::fs::write(
                 &runtime_csproj,
                 format_runtime_csproj(&versions.net, &versions.framework),
             )
-            .unwrap();
+                .unwrap();
 
+            #[cfg(feature = "download-runtime")]
             {
-                let result = reqwest::blocking::Client::new()
-                    .get("https://raw.githubusercontent.com/Tired-Fox/bevy_cs_managed/refs/heads/main/Runtime.cs")
-                    .send()
+                let mut result = ureq::get("https://raw.githubusercontent.com/Tired-Fox/bevy_cs_managed/refs/heads/master/Runtime.cs")
+                    .call()
                     .unwrap();
 
-                std::fs::write(runtime_dir.join("Runtime.cs"), result.text().unwrap()).unwrap();
+                std::fs::write(&runtime_cs, result.body_mut().read_to_string().unwrap()).unwrap();
+            }
+            #[cfg(not(feature = "download-runtime"))]
+            {
+                if !runtime_cs.exists() {
+                    panic!("missing Runtime.cs file. Can be found at https://github.com/Tired-Fox/bevy_cs_managed/blob/master/Runtime.cs");
+                }
             }
 
-            log::debug!("[C# Runtime] compiling {}", runtime_csproj.display());
+            log::debug!("compiling {}", runtime_csproj.display());
 
             let build_log = runtime_dir.join("build.log");
             if build_log.exists() {
@@ -405,7 +410,6 @@ impl Runtime {
             .arg(&runtime_csproj)
             .args(["-c", "Release"])
             .arg(format!("/flp:v=q;logfile={}", build_log.display()))
-            .arg("/clp:ErrorsOnly")
             .output()
             .unwrap();
 
@@ -416,7 +420,7 @@ impl Runtime {
             if build_log.exists() {
                 let diag = std::fs::read_to_string(&build_log).unwrap();
                 let pattern = regex::Regex::new(
-                    r"(.+)\((\d+),(\d+)\): (warning|error) ([^:]+): (.+) \[([^\]]+)\]",
+                    r"(.+)\((\d+),(\d+)\): (warning|error) ([^:]+): (.+) \[[^\]]+\]",
                 )
                 .unwrap();
 
@@ -424,7 +428,6 @@ impl Runtime {
                     .filter_map(|v| pattern.captures(v))
                     .for_each(|v| {
                         Diagnostic {
-                            source: PathBuf::from(v[7].to_string()),
                             file: PathBuf::from(v[1].to_string()),
                             line: v[2].parse::<usize>().unwrap(),
                             column: v[3].parse::<usize>().unwrap(),
@@ -439,20 +442,20 @@ impl Runtime {
                     });
             }
 
-            log::debug!("[c#-runtime] copying Runtime.runtimeconfig.json to output");
+            log::debug!("copying Runtime.runtimeconfig.json to output");
             std::fs::copy(&runtimeconfig_bin, &paths.config).unwrap();
-            log::debug!("[C# Runtime] copying Runtime.dll to output");
+            log::debug!("copying Runtime.dll to output");
             std::fs::copy(&runtime_dll_bin, &paths.dll).unwrap();
-        }
+        } else {
+            if !paths.config.exists() {
+                log::debug!("copying Runtime.runtimeconfig.json to output");
+                std::fs::copy(&runtimeconfig_bin, &paths.config).unwrap();
+            }
 
-        if !paths.config.exists() {
-            log::debug!("[c#-runtime] copying Runtime.runtimeconfig.json to output");
-            std::fs::copy(&runtimeconfig_bin, &paths.config).unwrap();
-        }
-
-        if !paths.dll.exists() {
-            log::debug!("[C# Runtime] copying Runtime.dll to output");
-            std::fs::copy(&runtime_dll_bin, &paths.dll).unwrap();
+            if !paths.dll.exists() {
+                log::debug!("copying Runtime.dll to output");
+                std::fs::copy(&runtime_dll_bin, &paths.dll).unwrap();
+            }
         }
     }
 
