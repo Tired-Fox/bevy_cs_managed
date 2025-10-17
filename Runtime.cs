@@ -1,7 +1,4 @@
 using System;
-using System.Buffers;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -9,7 +6,6 @@ using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
 using System.Text;
-using System.Text.Json;
 
 class Utils
 {
@@ -18,13 +14,29 @@ class Utils
         if (p == IntPtr.Zero) return string.Empty;
         return Marshal.PtrToStringUTF8(p)!;
     }
+
+    static IntPtr AllocUtf8(string s, out int len)
+    {
+        // allocate CoTaskMem UTF-8 (host must call FreeMemory)
+        var bytes = Encoding.UTF8.GetBytes(s);
+        len = bytes.Length;
+        var dst = Marshal.AllocCoTaskMem(len + 1);
+        Marshal.Copy(bytes, 0, dst, len);
+        Marshal.WriteByte(dst, len, 0);
+        return dst;
+    }
+
+    public static IntPtr Pin(object obj, bool pinned = false) => GCHandle.ToIntPtr(GCHandle.Alloc(obj, pinned ? GCHandleType.Pinned : GCHandleType.Normal));
+
+    public static void Unpin(IntPtr id) => GCHandle.FromIntPtr(id).Free();
+
+    public static T? Ref<T>(IntPtr target) => (T?)GCHandle.FromIntPtr(target).Target;
 }
 
 public class RuntimeAssembly
 {
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void GetClassDelegate(Assembly assembly, IntPtr typeNameUtf8Z, out IntPtr result); // returns type handle
-
     public static void GetClass(Assembly assembly, IntPtr typeNameUtf8Z, out IntPtr result)
     {
         var tn = Utils.ReadUtf8Z(typeNameUtf8Z);
@@ -32,7 +44,7 @@ public class RuntimeAssembly
         if (t == null) {
             result = IntPtr.Zero;
         } else {
-            result = Host.Pin(t);
+            result = Utils.Pin(t);
         }
     }
 
@@ -50,42 +62,41 @@ public class RuntimeAssembly
     public static Type? ResolveTypeInContext(Scope scope, string fullOrShort) => null;
 }
 
-public sealed class RuntimeClass
+public class RuntimeClass
 {
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void NewDelegate(IntPtr klass, out IntPtr result);
+    public static void New(IntPtr klass, out IntPtr result)
+    {
+        var t = Utils.Ref<Type>(klass) ?? throw new ArgumentNullException("Class is null");
+        var obj = Activator.CreateInstance(t) ?? throw new MissingMethodException($"No default ctor for {t.FullName}");
+        result = Utils.Pin(obj);
+    }
+
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void IsAssignableFromDelegate(IntPtr baseKlass, IntPtr targetKlass, out int result);
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void GetMethodDelegate(IntPtr klass, IntPtr nameUtf8Z, int argCount, out IntPtr result);
-
     public static void IsAssignableFrom(IntPtr baseKlass, IntPtr targetKlass, out int result)
     {
-        var baseType = Host.Ref<Type>(baseKlass);
-        var targetType = Host.Ref<Type>(targetKlass);
+        var baseType = Utils.Ref<Type>(baseKlass) ?? throw new ArgumentNullException("Base class is null");
+        var targetType = Utils.Ref<Type>(targetKlass) ?? throw new ArgumentNullException("Target class is null");
         result = baseType.IsAssignableFrom(targetType) ? 1 : 0;
     }
 
-    public static void New(IntPtr klass, out IntPtr result)
-    {
-        var t = Host.Ref<Type>(klass);
-        var obj = Activator.CreateInstance(t) ?? throw new MissingMethodException($"No default ctor for {t.FullName}");
-        result = Host.Pin(obj);
-    }
-
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void GetMethodDelegate(IntPtr klass, IntPtr nameUtf8Z, int argCount, out IntPtr result);
     public static void GetMethod(IntPtr klass, IntPtr name, int argCount, out IntPtr result)
     {
-        var t = Host.Ref<Type>(klass);
+        var t = Utils.Ref<Type>(klass) ?? throw new ArgumentNullException("Class is null");
         var methodName = Utils.ReadUtf8Z(name);
 
         var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance;
         var cand = t.GetMethods(flags).Where(m => m.Name == methodName && m.GetParameters().Length == argCount).FirstOrDefault<MethodInfo>();
 
-        result = cand == null ? IntPtr.Zero : Host.Pin(cand);
+        result = cand == null ? IntPtr.Zero : Utils.Pin(cand);
     }
 }
 
-public sealed class RuntimeMethod
+public class RuntimeMethod
 {
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public unsafe delegate void RuntimeInvokeDelegate(IntPtr method, void* instance, void** args);
@@ -93,7 +104,7 @@ public sealed class RuntimeMethod
     {
         Console.WriteLine("Runtime invoking method");
 
-        var m = Host.Ref<MethodInfo>(method);
+        var m = Utils.Ref<MethodInfo>(method) ?? throw new ArgumentNullException("Method is null");
 
         Console.WriteLine("  - Get params and arg length");
         var parameters = m.GetParameters();
@@ -103,7 +114,7 @@ public sealed class RuntimeMethod
         if (instancePtr != null)
         {
             Console.WriteLine("  - Unbox instance");
-            instance = Host.Ref<object>((IntPtr)instancePtr);
+            instance = Utils.Ref<object>((IntPtr)instancePtr);
         }
 
         Console.WriteLine($"  - Unbox args [{argc}]");
@@ -152,11 +163,12 @@ public sealed class RuntimeMethod
         if (elem == typeof(bool))   return Unsafe.Read<byte>(p) != 0;       // define size!
         if (elem == typeof(float))  return Unsafe.Read<float>(p);
         if (elem == typeof(double)) return Unsafe.Read<double>(p);
-        if (elem.IsEnum)
+        if (elem != null && elem.IsEnum)
         {
-            var u = Enum.GetUnderlyingType(t);
-            object raw = ReadValueAsObject(p, u);
-            return Enum.ToObject(t, Convert.ChangeType(raw, u));
+            var u = Enum.GetUnderlyingType(t) ?? typeof(int);
+            object? raw = ReadValueAsObject(p, u);
+            raw = Convert.ChangeType(raw, u);
+            return raw == null ? null : Enum.ToObject(t, raw);
         }
 
         // Blittable structs → Marshal.PtrToStructure (boxed)
@@ -167,13 +179,6 @@ public sealed class RuntimeMethod
 
 public sealed class Scope : AssemblyLoadContext
 {
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void LoadFromPathDelegate(IntPtr scopeId, IntPtr pathUtf8Z, out Assembly result);
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void LoadFromBytesDelegate(IntPtr scopeId, IntPtr bytes, int length, out Assembly result);
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void UnloadDelegate(IntPtr scopeId);
-
     public readonly string BaseDir;
 
     public Scope(string baseDir) : base(isCollectible: true)
@@ -181,9 +186,11 @@ public sealed class Scope : AssemblyLoadContext
         BaseDir = baseDir;
     }
 
-    public static void LoadFromPath(IntPtr scope, IntPtr path, out Assembly result)
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void LoadFromPathDelegate(IntPtr scopeId, IntPtr pathUtf8Z, out Assembly result);
+    public static void LoadFromPath(IntPtr scope, IntPtr path, out Assembly? result)
     {
-        var self = Host.Ref<Scope>(scope);
+        var self = Utils.Ref<Scope>(scope) ?? throw new ArgumentNullException("Scope is null");
         var p = Path.Combine(self.BaseDir, Utils.ReadUtf8Z(path));
         try
         {
@@ -195,11 +202,13 @@ public sealed class Scope : AssemblyLoadContext
         }
     }
 
-    public static void LoadFromBytes(IntPtr scope, IntPtr bytes, int length, out Assembly result)
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void LoadFromBytesDelegate(IntPtr scopeId, IntPtr bytes, int length, out Assembly result);
+    public static void LoadFromBytes(IntPtr scope, IntPtr bytes, int length, out Assembly? result)
     {
         unsafe
         {
-            var self = Host.Ref<Scope>(scope);
+            var self = Utils.Ref<Scope>(scope) ?? throw new ArgumentNullException("Scope is null");
             var span = new ReadOnlySpan<byte>((void*)bytes, length);
             using var ms = new MemoryStream(span.ToArray());
             try
@@ -213,10 +222,12 @@ public sealed class Scope : AssemblyLoadContext
         }
     }
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void UnloadDelegate(IntPtr scopeId);
     public static void Unload(IntPtr scope)
     {
         var handle = GCHandle.FromIntPtr(scope);
-        var target = (Scope)handle.Target;
+        var target = (Scope?)handle.Target ?? throw new ArgumentNullException("Scope is null");
 
         target.Unload();
         handle.Free();
@@ -225,146 +236,29 @@ public sealed class Scope : AssemblyLoadContext
     }
 }
 
-public static class Host
+public class Host
 {
-    // ---------- Delegates (unmanaged stubs will match these) ----------
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void CreateScopeDelegate(IntPtr baseDir, out IntPtr result);
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void DestroyDelegate(IntPtr handle);  // frees any object/type/assembly handle
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void FreeDelegate(IntPtr ptr);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void PingDelegate(out uint result);
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate IntPtr CallMethodJsonDelegate(IntPtr objectHandle, IntPtr methodNameUtf8Z, IntPtr jsonArgsUtf8Z, out int outLen);
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate IntPtr CallStaticJsonDelegate(IntPtr scopeId, IntPtr typeNameUtf8Z, IntPtr methodNameUtf8Z, IntPtr jsonArgsUtf8Z, out int outLen);
-
-    // ---------- State & handles ----------
-    static readonly JsonSerializerOptions JsonOpts = new()
-    {
-        PropertyNameCaseInsensitive = true,
-        AllowTrailingCommas = true
-    };
-
-    // ---------- helpers ----------
-    static unsafe string ReadUtf8Z(IntPtr p)
-    {
-        if (p == IntPtr.Zero) return string.Empty;
-        return Marshal.PtrToStringUTF8(p)!;
-    }
-
-    static IntPtr AllocUtf8(string s, out int len)
-    {
-        // allocate CoTaskMem UTF-8 (host must call FreeMemory)
-        var bytes = Encoding.UTF8.GetBytes(s);
-        len = bytes.Length;
-        var dst = Marshal.AllocCoTaskMem(len + 1);
-        Marshal.Copy(bytes, 0, dst, len);
-        Marshal.WriteByte(dst, len, 0);
-        return dst;
-    }
-
-    public static IntPtr Pin(object obj, bool pinned = false) => GCHandle.ToIntPtr(GCHandle.Alloc(obj, pinned ? GCHandleType.Pinned : GCHandleType.Normal));
-    public static T Ref<T>(IntPtr target) => (T)GCHandle.FromIntPtr(target).Target;
-    public static void Unpin(IntPtr id) => GCHandle.FromIntPtr(id).Free();
-
-    static object? InvokeWithJson(object? targetOrNull, Type declaringType, string methodName, string jsonArgs)
-    {
-        // Interpret args JSON as array: [ ... ]
-        object[] args = Array.Empty<object>();
-        if (!string.IsNullOrWhiteSpace(jsonArgs))
-        {
-            using var doc = JsonDocument.Parse(jsonArgs);
-            if (doc.RootElement.ValueKind == JsonValueKind.Array)
-                args = doc.RootElement.EnumerateArray().Select(e => (object)e.Clone()).ToArray();
-            else if (doc.RootElement.ValueKind != JsonValueKind.Undefined && doc.RootElement.ValueKind != JsonValueKind.Null)
-                args = new object[] { doc.RootElement.Clone() };
-        }
-
-        // Find method candidates: instance or static depending on targetOrNull
-        var flags = BindingFlags.Public | BindingFlags.NonPublic | (targetOrNull is null ? BindingFlags.Static : BindingFlags.Instance);
-        var cands = declaringType.GetMethods(flags).Where(m => m.Name == methodName);
-
-        foreach (var m in cands)
-        {
-            var ps = m.GetParameters();
-            if (ps.Length != args.Length) continue;
-
-            var callArgs = new object?[ps.Length];
-            bool ok = true;
-
-            for (int i = 0; i < ps.Length && ok; i++)
-            {
-                var ptype = ps[i].ParameterType;
-
-                // If we kept JsonElement clones, materialize to the exact parameter type
-                if (args[i] is JsonElement je)
-                {
-                    try
-                    {
-                        // deserialize directly to the param type
-                        callArgs[i] = JsonSerializer.Deserialize(je.GetRawText(), ptype, JsonOpts);
-                    }
-                    catch
-                    {
-                        ok = false;
-                    }
-                }
-                else
-                {
-                    // last-ditch convertible
-                    try { callArgs[i] = Convert.ChangeType(args[i], ptype); }
-                    catch { ok = false; }
-                }
-            }
-
-            if (!ok) continue;
-
-            return m.Invoke(targetOrNull, callArgs);
-        }
-
-        throw new MissingMethodException($"No compatible overload for {declaringType.FullName}.{methodName} with {args.Length} args.");
-    }
-
-    // ---------- Exported (via managed delegates) ----------
     public static void Ping(out uint result) => result = 1;
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void CreateScopeDelegate(IntPtr baseDir, out IntPtr result);
     public static void CreateScope(IntPtr baseDir, out IntPtr result)
     {
         // Use current assembly directory for probing by default
-        var dir = baseDir == IntPtr.Zero ? Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)! : ReadUtf8Z(baseDir);
-        result = Pin(new Scope(dir));
+        var dir = baseDir == IntPtr.Zero ? Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)! : Utils.ReadUtf8Z(baseDir);
+        result = Utils.Pin(new Scope(dir));
     }
 
-    public static void Destroy(IntPtr handle) => Unpin(handle);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void DestroyDelegate(IntPtr handle);  // frees any object/type/assembly handle
+    public static void Destroy(IntPtr handle) => Utils.Unpin(handle);
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void FreeDelegate(IntPtr ptr);
     public static void Free(IntPtr ptr)
     {
         if (ptr != IntPtr.Zero) Marshal.FreeCoTaskMem(ptr);
-    }
-
-    public static IntPtr CallMethodJson(IntPtr objectHandle, IntPtr methodNameUtf8Z, IntPtr jsonArgsUtf8Z, out int outLen)
-    {
-        var obj = Ref<object>(objectHandle);
-        var method = ReadUtf8Z(methodNameUtf8Z);
-        var json = ReadUtf8Z(jsonArgsUtf8Z);
-        var result = InvokeWithJson(obj, obj.GetType(), method, json);
-        var payload = JsonSerializer.Serialize(result, JsonOpts);
-        return AllocUtf8(payload, out outLen);
-    }
-
-    public static IntPtr CallStaticJson(IntPtr scopeHandle, IntPtr typeNameUtf8Z, IntPtr methodNameUtf8Z, IntPtr jsonArgsUtf8Z, out int outLen)
-    {
-        var scope = Ref<Scope>(scopeHandle);
-        var tn = ReadUtf8Z(typeNameUtf8Z);
-        var t = RuntimeAssembly.ResolveTypeInContext(scope, tn) ?? throw new TypeLoadException($"Type not found: {tn}");
-        var method = ReadUtf8Z(methodNameUtf8Z);
-        var json = ReadUtf8Z(jsonArgsUtf8Z);
-        var result = InvokeWithJson(null, t, method, json);
-        var payload = JsonSerializer.Serialize(result, JsonOpts);
-        return AllocUtf8(payload, out outLen);
     }
 }

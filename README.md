@@ -23,6 +23,8 @@ mobile and web, or making it compatible with [Mono](https://www.mono-project.com
 
 - How to dynamically bind and generate the `Engine` C# api. This includes user defined types that implement `Reflect` and is `Reflectable`
 - Dynamically generate the .Net project file, `csproj` and `sln`, so it imports the `Engine` api
+- How to bind method params both for objects and native types as a `object?[]` to send to `MethodInfo.Invoke`
+- How to map structs and enums to c# types. When they are passed to c# managed code how will modification and interaction work?
 
 ### Todo
 
@@ -46,3 +48,8 @@ mobile and web, or making it compatible with [Mono](https://www.mono-project.com
 - [ ] Bundle the users .Net with final compiled dll files for distrobution
 - [ ] Optionally use [Mono]() for all platforms or mobile and web
 
+### Notes
+
+- Opting to bind Runtime methods by writing a delegate signature with `[UnmanagedFunctionPointer(CallingConvention.Cdecl)]` and a matching method with the same signature to allow for `out` c# params
+- C# `Engine` namespace will have an static `Interop` class with a table of unmanaged delegates that point to rust functions that can be called from Managed code.
+- C# `Engine` namespace will have a static `Interop` class with a pointer to the current `world` to allow for context sensitive `interop` calls to manipulate and query the `world`

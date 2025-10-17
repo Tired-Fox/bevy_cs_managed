@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 download-runtime = ["dep:ureq"]
+always-build-runtime = []
 
 [profile.dev]
 opt-level = 1

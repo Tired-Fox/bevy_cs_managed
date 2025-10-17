@@ -1,6 +1,5 @@
 use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
+    ffi::c_void, path::{Path, PathBuf}, sync::Arc
 };
 
 use bevy::ecs::resource::Resource;
@@ -59,28 +58,68 @@ pub fn get_dotnet_path() -> Option<PathBuf> {
     dotnet_path.exists().then_some(dotnet_path)
 }
 
+fn format_managed_csproj(net: &str, framework: &str) -> String {
+    format!(
+        r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>{net}</TargetFramework>
+    <RuntimeFrameworkVersion>{framework}</RuntimeFrameworkVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <DebugType>portable</DebugType>
+    <Nullable>enable</Nullable>
+    <RollForward>Disable</RollForward>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Update="Microsoft.NETCore.App" RuntimeFrameworkVersion="{framework}" />
+    <!-- Ignore dynamically generated Engine files -->
+    <Compile Remove="engine\**" />
+    <!-- Reference the dynamically built Engine.dll -->
+    <ProjectReference Include="engine\Engine.csproj" />
+  </ItemGroup>
+</Project>"#
+    )
+}
+
+fn format_engine_csproj(net: &str, framework: &str) -> String {
+    format!(
+        r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>{net}</TargetFramework>
+    <RuntimeFrameworkVersion>{framework}</RuntimeFrameworkVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <DebugType>portable</DebugType>
+    <Nullable>enable</Nullable>
+    <RollForward>Disable</RollForward>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Update="Microsoft.NETCore.App" RuntimeFrameworkVersion="{framework}" />
+  </ItemGroup>
+</Project>"#
+    )
+}
+
 fn format_runtime_csproj(net: &str, framework: &str) -> String {
     format!(
         r#"<Project Sdk="Microsoft.NET.Sdk">
-      <PropertyGroup>
-        <TargetFramework>{net}</TargetFramework>
-        <RuntimeFrameworkVersion>{framework}</RuntimeFrameworkVersion>
-        <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+  <PropertyGroup>
+    <TargetFramework>{net}</TargetFramework>
+    <RuntimeFrameworkVersion>{framework}</RuntimeFrameworkVersion>
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
 
-        <RollForward>Disable</RollForward>
-        <UseWindowsForms>false</UseWindowsForms>
-        <UseWPF>false</UseWPF>
-        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-        <Nullable>enable</Nullable>
+    <RollForward>Disable</RollForward>
+    <UseWindowsForms>false</UseWindowsForms>
+    <UseWPF>false</UseWPF>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
 
-        <EnableComHosting>false</EnableComHosting>
-        <IsComHostedApp>false</IsComHostedApp>
-        <EnableGeneratedComInterfaceSourceGenerators>false</EnableGeneratedComInterfaceSourceGenerators>
-      </PropertyGroup>
-      <ItemGroup>
-        <FrameworkReference Update="Microsoft.NETCore.App" RuntimeFrameworkVersion="{framework}" />
-      </ItemGroup>
-    </Project>"#
+    <EnableComHosting>false</EnableComHosting>
+    <IsComHostedApp>false</IsComHostedApp>
+    <EnableGeneratedComInterfaceSourceGenerators>false</EnableGeneratedComInterfaceSourceGenerators>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Update="Microsoft.NETCore.App" RuntimeFrameworkVersion="{framework}" />
+  </ItemGroup>
+</Project>"#
     )
 }
 
@@ -183,34 +222,6 @@ impl Hostfxr {
     }
 }
 
-impl Drop for Hostfxr {
-    fn drop(&mut self) {
-        unsafe { self.lib.hostfxr_close(self.ctx) };
-    }
-}
-
-pub struct RuntimePaths {
-    pub config: PathBuf,
-    pub dll: PathBuf,
-    pub dotnet: PathBuf,
-    pub hostfxr: PathBuf,
-}
-
-pub struct RuntimeVersions {
-    pub framework: String,
-    pub net: String,
-}
-
-#[derive(Resource)]
-pub struct Runtime {
-    #[allow(dead_code)]
-    host: Hostfxr,
-    pub paths: RuntimePaths,
-    pub versions: RuntimeVersions,
-
-    ping: unsafe extern "system" fn(*mut u32) -> i32,
-}
-
 enum Level {
     Warning,
     Error,
@@ -244,6 +255,58 @@ impl Diagnostic {
                 self.message
             ),
         }
+    }
+}
+
+pub struct Scope {
+    inner: *const c_void,
+}
+
+pub struct RuntimePaths {
+    pub config: PathBuf,
+    pub dll: PathBuf,
+    pub dotnet: PathBuf,
+    pub hostfxr: PathBuf,
+    pub managed: PathBuf,
+}
+
+pub struct RuntimeVersions {
+    pub framework: String,
+    pub net: String,
+}
+
+pub struct RuntimeManaged {
+    pub(crate) ping: unsafe extern "system" fn(*mut u32) -> i32,
+    pub(crate) create_scope: unsafe extern "system" fn(*const c_void, *mut *const c_void) -> i32,
+    pub(crate) unload_scope: unsafe extern "system" fn(*const c_void) -> i32,
+}
+
+/// # Saftey
+/// Not safe when used outside of bevy's ecs like in an alternate thread not managed by bevy
+#[allow(dead_code)]
+#[derive(Resource)]
+pub struct Runtime {
+    paths: RuntimePaths,
+    versions: RuntimeVersions,
+
+    host: Hostfxr,
+    managed: RuntimeManaged,
+
+    scope: Option<Scope>,
+}
+
+// Bevy garuntees that one system at a time is using the resource.
+unsafe impl Send for Runtime {}
+unsafe impl Sync for Runtime {}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if let Some(scope) = self.scope.as_ref() {
+            self.unload_scope(scope);
+        }
+
+        // Release hostfxr context
+        unsafe { self.host.lib.hostfxr_close(self.host.ctx) };
     }
 }
 
@@ -309,6 +372,7 @@ impl Runtime {
                     "hostfxr.dylib"
                 }
             }),
+            managed: config.managed.clone(),
         };
 
         log::debug!("Paths:");
@@ -316,6 +380,7 @@ impl Runtime {
         log::debug!("    hostfxr: {}", paths.hostfxr.display());
         log::debug!("    config: {}", paths.config.display());
         log::debug!("    dll: {}", paths.dll.display());
+        log::debug!("    managed: {}", paths.managed.display());
 
         // TODO: Research whether this can be done once when packaging for
         //  production (Release)
@@ -325,17 +390,29 @@ impl Runtime {
         let host = Hostfxr::new(&paths);
 
         Self {
-            ping: unsafe {
-                std::mem::transmute(host.get_function_with_delegate(
-                    "Host, Runtime",
-                    "Ping",
-                    "Host+PingDelegate, Runtime",
-                ))
+            managed: unsafe {
+                RuntimeManaged {
+                    ping: std::mem::transmute(host.get_function_with_delegate(
+                        "Host, Runtime",
+                        "Ping",
+                        "Host+PingDelegate, Runtime",
+                    )),
+                    create_scope: std::mem::transmute(host.get_function_with_delegate(
+                        "Host, Runtime",
+                        "CreateScope",
+                        "Host+CreateScopeDelegate, Runtime",
+                    )),
+                    unload_scope: std::mem::transmute(host.get_function_with_delegate(
+                        "Scope, Runtime",
+                        "Unload",
+                        "Scope+UnloadDelegate, Runtime",
+                    )),
+                }
             },
-
             host,
             paths,
             versions,
+            scope: None,
         }
     }
 
@@ -354,7 +431,8 @@ impl Runtime {
             .join("Runtime.dll");
         let runtime_cs = runtime_dir.join("Runtime.cs");
 
-        if !runtime_dll_bin.exists()
+        #[cfg(not(feature = "always-build-runtime"))]
+        let needs_rebuils = !runtime_dll_bin.exists()
             || !runtimeconfig_bin.exists()
             || !runtime_csproj.exists()
             || !std::fs::read_to_string(&runtime_csproj)
@@ -362,8 +440,11 @@ impl Runtime {
                 .contains(&format!(
                     "<RuntimeFrameworkVersion>{}</RuntimeFrameworkVersion>",
                     &versions.framework
-                ))
-        {
+                ));
+        #[cfg(feature = "always-build-runtime")]
+        let needs_rebuild = true;
+
+        if needs_rebuild {
             if !runtime_dir.exists() {
                 std::fs::create_dir_all(&runtime_dir).unwrap();
             }
@@ -375,7 +456,7 @@ impl Runtime {
                 .unwrap();
 
             #[cfg(feature = "download-runtime")]
-            {
+            if !runtime_cs.exists() {
                 let mut result = ureq::get("https://raw.githubusercontent.com/Tired-Fox/bevy_cs_managed/refs/heads/master/Runtime.cs")
                     .call()
                     .unwrap();
@@ -383,10 +464,8 @@ impl Runtime {
                 std::fs::write(&runtime_cs, result.body_mut().read_to_string().unwrap()).unwrap();
             }
             #[cfg(not(feature = "download-runtime"))]
-            {
-                if !runtime_cs.exists() {
-                    panic!("missing Runtime.cs file. Can be found at https://github.com/Tired-Fox/bevy_cs_managed/blob/master/Runtime.cs");
-                }
+            if !runtime_cs.exists() {
+                panic!("missing Runtime.cs file. Can be found at https://github.com/Tired-Fox/bevy_cs_managed/blob/master/Runtime.cs");
             }
 
             log::debug!("compiling {}", runtime_csproj.display());
@@ -459,10 +538,54 @@ impl Runtime {
         }
     }
 
+    pub fn get_config_path(&self) -> &Path {
+        &self.paths.config
+    }
+
+    pub fn get_dll_path(&self) -> &Path {
+        &self.paths.dll
+    }
+
+    pub fn get_dotnet_path(&self) -> &Path {
+        &self.paths.dotnet
+    }
+
+    pub fn get_hostfxr_path(&self) -> &Path {
+        &self.paths.hostfxr
+    }
+
+    pub fn get_managed_path(&self) -> &Path {
+        &self.paths.managed
+    }
+
+    pub fn get_framework_version(&self) -> &str {
+        &self.versions.framework
+    }
+
+    pub fn get_net_version(&self) -> &str {
+        &self.versions.net
+    }
+
     pub fn ping(&self) -> bool {
         let mut out: u32 = 0;
-        unsafe { (self.ping)(&raw mut out) };
+        unsafe { (self.managed.ping)(&raw mut out) };
         out == 1
+    }
+
+    pub fn destroy(&self) -> *const c_void {
+        let mut out: *const c_void = std::ptr::null();
+        unsafe { (self.managed.create_scope)(std::ptr::null(), &raw mut out) };
+        out
+    }
+
+    pub fn create_scope(&self) -> Scope {
+        let mut out: *const c_void = std::ptr::null();
+        unsafe { (self.managed.create_scope)(std::ptr::null(), &raw mut out) };
+        Scope { inner: out }
+    }
+
+    pub fn unload_scope(&self, scope: &Scope) {
+        unsafe { (self.managed.unload_scope)(scope.inner) };
     }
 }
 
@@ -528,9 +651,9 @@ impl Default for Version {
     }
 }
 
-#[derive(Default)]
 pub struct CSharpScripting {
     pub version: Version,
+    pub managed: PathBuf,
 }
 
 impl bevy::app::Plugin for CSharpScripting {
@@ -540,6 +663,20 @@ impl bevy::app::Plugin for CSharpScripting {
     }
 }
 
-fn setup(runtime: bevy::prelude::Res<Runtime>) {
-    log::info!("Ping: {}", runtime.ping());
+fn setup(mut runtime: bevy::prelude::ResMut<Runtime>) {
+    assert!(runtime.ping(), "failed to bind and initialize C# Runtime");
+    runtime.scope = Some(runtime.create_scope());
+
+    if !runtime.get_managed_path().exists() {
+        std::fs::create_dir_all(runtime.get_managed_path()).unwrap();
+    }
+
+    let engine_path = runtime.get_managed_path().join("engine");
+    if !engine_path.exists() {
+        std::fs::create_dir_all(&engine_path).unwrap();
+    }
+
+    std::fs::write(engine_path.join("Engine.csproj"), format_engine_csproj(runtime.get_net_version(), runtime.get_framework_version())).unwrap();
+    std::fs::write(runtime.get_managed_path().join("Managed.csproj"), format_managed_csproj(runtime.get_net_version(), runtime.get_framework_version())).unwrap();
+    // TODO: Compile engine code
 }
