@@ -22,14 +22,20 @@ mobile and web, or making it compatible with [Mono](https://www.mono-project.com
 ### Unknowns
 
 - How to dynamically bind and generate the `Engine` C# api. This includes user defined types that implement `Reflect` and is `Reflectable`
+- Will this plugin provide most of bevy builtin types or will the user have to expose what they want?
+- How third party plugins and types can be reflected and registered
 - Dynamically generate the .Net project file, `csproj` and `sln`, so it imports the `Engine` api
 - How to bind method params both for objects and native types as a `object?[]` to send to `MethodInfo.Invoke`
 - How to map structs and enums to c# types. When they are passed to c# managed code how will modification and interaction work?
 
+### Examples
+
+1. Simple: `cargo run --example=simple --features=download-runtime`
+
 ### Todo
 
 - [x] Find .Net and Hostfxr version
-- [-] Write a .Net runtime similar to `Mono` to allow for the following:
+- [ ] Write a .Net runtime similar to `Mono` to allow for the following:
     - [x] scoping
     - [x] loading dll
     - [ ] searching and validating types
@@ -66,5 +72,5 @@ mobile and web, or making it compatible with [Mono](https://www.mono-project.com
 ### Notes
 
 - Opting to bind Runtime methods by writing a delegate signature with `[UnmanagedFunctionPointer(CallingConvention.Cdecl)]` and a matching method with the same signature to allow for `out` c# params
-- C# `Engine` namespace will have an static `Interop` class with a table of unmanaged delegates that point to rust functions that can be called from Managed code.
+- C# `Engine` namespace will have a static `Interop` class with a table of unmanaged delegates that point to rust functions that can be called from Managed code.
 - C# `Engine` namespace will have a static `Interop` class with a pointer to the current `world` to allow for context sensitive `interop` calls to manipulate and query the `world`
