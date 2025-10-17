@@ -1,0 +1,47 @@
+# Bevy CS Managed
+
+A Bevy plugin that adds a .NET C# Scripting runtime
+
+> [!WARNING]
+> This project is in early development and is very experimental
+
+### What it does
+
+1. Finds an appropriate .Net version on the users system
+2. Builds the runtime, engine, and scripts into dll files
+3. Loads and manages dll files
+4. Hot re-compile scripts
+5. Binds script methods to lifetime and event hooks
+6. Customizable to the users components and setup
+
+### Limitations
+
+Currently the .Net Runtime distrobution format of this plugin only supports desktop targets (windows, linux, macos). With more research this may expand to
+mobile and web, or making it compatible with [Mono](https://www.mono-project.com/) could allow for Mono to be used for mobile and web targets.
+
+### Unknowns
+
+- How to dynamically bind and generate the `Engine` C# api. This includes user defined types that implement `Reflect` and is `Reflectable`
+- Dynamically generate the .Net project file, `csproj` and `sln`, so it imports the `Engine` api
+
+### Todo
+
+- [x] Find .Net and Hostfxr version
+- [-] Write a .Net runtime similar to `Mono` to allow for the following:
+    - [x] scoping
+    - [x] loading dll
+    - [ ] searching and validating types
+    - [ ] fetching and calling methods
+    - [ ] Optimal memory management.
+        - Is `GCHandle.Alloc` with `GCHandle.Free` on `Drop` good enough?
+        - Is it better to find a way to make the data returned raw pointers which can be pinned with the runtime api similar to Mono?
+- [x] Compile runtime based on the users installed .Net
+- [-] `download-runtime` feature to automatically download Runetime.cs if missing
+- [-] Bind runtime based on the users installed .Net
+- [ ] Compile user scripts
+- [ ] Load user Scripts
+- [ ] Bind user script methods to hooks
+- [ ] Hot reload and compile user scripts on file changes
+- [ ] Bundle the users .Net with final compiled dll files for distrobution
+- [ ] Optionally use [Mono]() for all platforms or mobile and web
+

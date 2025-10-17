@@ -1,0 +1,39 @@
+[package]
+name = "scripting"
+version = "0.0.0"
+edition = "2024"
+
+[features]
+download-runtime = ["dep:reqwest"]
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+[profile.wasm-release]
+inherits = "release"
+# Optimize with size in mind (also try "z", sometimes it is better).
+# Slightly slows compile times, great improvements to file size and runtime performance.
+opt-level = "s"
+# Strip all debugging information from the binary to slightly reduce file size.
+strip = "debuginfo"
+
+[dependencies]
+bevy = "0.17.2"
+dirs = "6.0.0"
+log = "0.4.28"
+regex = "1.12.2"
+reqwest = { version = "0.12.24", optional = true, features = ["blocking"] }
+
+# Dotnet bootstrap
+coreclr-hosting-shared = { version = "0.1.4", default-features = false }
+hostfxr-sys = { version = "0.12.0", features = ["latest", "wrapper", "optional-apis", "undocumented", "enum-map"], default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+widestring = "1.2.1"
