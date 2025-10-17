@@ -1,3 +1,9 @@
-examples/**/bin
-examples/**/obj
+# Files generated from scripting plugin
+**/bin
+**/obj
+**/.bin
+**/.obj
+**/*.csproj
+**/build.log
+
 /target

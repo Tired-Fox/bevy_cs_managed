@@ -39,13 +39,28 @@ mobile and web, or making it compatible with [Mono](https://www.mono-project.com
         - Is `GCHandle.Alloc` with `GCHandle.Free` on `Drop` good enough?
         - Is it better to find a way to make the data returned raw pointers which can be pinned with the runtime api similar to Mono?
 - [x] Compile runtime based on the users installed .Net
-- [-] `download-runtime` feature to automatically download Runetime.cs if missing
-- [-] Bind runtime based on the users installed .Net
+- [x] `download-runtime` feature to automatically download Runetime.cs if missing
+- [x] Bind runtime based on the users installed .Net
+- [ ] Bind interop functions
+- [ ] Bind interop data
+- [ ] Generate Engine API bindings
+- [ ] Compile Engine API
+    - [x] Compile and Copy dll
+    - [ ] Gracefully handle errors
+- [ ] Load Engine API
 - [ ] Compile user scripts
+    - [x] Compile and Copy dll
+    - [ ] Gracefully handle errors
 - [ ] Load user Scripts
 - [ ] Bind user script methods to hooks
 - [ ] Hot reload and compile user scripts on file changes
-- [ ] Bundle the users .Net with final compiled dll files for distrobution
+- [ ] Build script for distrobution (production) builds
+    - [ ] Lock behind feature flag
+    - [ ] Bundle the users selected .Net
+    - [ ] Compiled and bundle
+        - [ ] Runtime dll and runtimeconfig
+        - [ ] Engine.dll
+        - [ ] Scripts.dll
 - [ ] Optionally use [Mono]() for all platforms or mobile and web
 
 ### Notes
