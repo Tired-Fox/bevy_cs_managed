@@ -1,5 +1,5 @@
 use std::{
-    ffi::c_void, path::{Path, PathBuf}, sync::Arc
+    ffi::c_void, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, sync::Arc
 };
 
 use bevy::ecs::resource::Resource;
@@ -7,6 +7,11 @@ use hostfxr_sys::{
     dlopen2::wrapper::Container, get_function_pointer_fn, hostfxr_delegate_type, hostfxr_handle,
     load_assembly_fn, wrapper::Hostfxr as HostfxrLibrary,
 };
+
+#[cfg(not(feature="distribute"))]
+static RUNTIME_CS: &[u8] = include_bytes!("../Runtime.cs");
+#[cfg(not(feature="distribute"))]
+static BUILDER_CS: &[u8] = include_bytes!("../Builder.cs");
 
 #[cfg(target_os = "windows")]
 pub fn to_char_t(value: impl AsRef<str>) -> widestring::U16String {
@@ -58,7 +63,7 @@ pub fn get_dotnet_path() -> Option<PathBuf> {
     dotnet_path.exists().then_some(dotnet_path)
 }
 
-fn format_managed_csproj(net: &str, framework: &str) -> String {
+fn format_scripts_csproj(net: &str, framework: &str) -> String {
     format!(
         r#"<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
@@ -71,10 +76,14 @@ fn format_managed_csproj(net: &str, framework: &str) -> String {
   </PropertyGroup>
   <ItemGroup>
     <FrameworkReference Update="Microsoft.NETCore.App" RuntimeFrameworkVersion="{framework}" />
-    <!-- Ignore dynamically generated Engine files -->
-    <Compile Remove="engine\**" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(Configuration)' == 'Debug'">
     <!-- Reference the dynamically built Engine.dll -->
-    <ProjectReference Include="engine\Engine.csproj" />
+    <ProjectReference Include="..\engine\Engine.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(Configuration)' != 'Debug'">
+    <!-- Reference the dynamically built Engine.dll -->
+    <ProjectReference Include="..\engine\.bin\Engine.dll" />
   </ItemGroup>
 </Project>"#
     )
@@ -93,6 +102,26 @@ fn format_engine_csproj(net: &str, framework: &str) -> String {
   </PropertyGroup>
   <ItemGroup>
     <FrameworkReference Update="Microsoft.NETCore.App" RuntimeFrameworkVersion="{framework}" />
+  </ItemGroup>
+</Project>"#
+    )
+}
+
+fn format_builder_csproj(net: &str, framework: &str) -> String {
+    format!(
+        r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>{net}</TargetFramework>
+    <RuntimeFrameworkVersion>{framework}</RuntimeFrameworkVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+	<PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.11.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="4.11.0" />
+    <PackageReference Include="Microsoft.Build.Locator" Version="1.6.10" />
   </ItemGroup>
 </Project>"#
     )
@@ -134,7 +163,7 @@ unsafe impl Sync for Hostfxr {}
 
 impl Hostfxr {
     pub fn new(paths: &RuntimePaths) -> Self {
-        log::debug!("initializing hostfxr");
+        log::debug!("[init] hostfxr");
 
         let hostfxr_library = unsafe {
             Container::<HostfxrLibrary>::load(&paths.hostfxr)
@@ -180,6 +209,7 @@ impl Hostfxr {
         let get_function_pointer: get_function_pointer_fn =
             unsafe { std::mem::transmute(get_function_pointer) };
 
+        log::debug!("[load] Runtime.dll");
         let dll = to_char_t(paths.dll.display().to_string());
         let result = unsafe { load_assembly(dll.as_ptr(), std::ptr::null(), std::ptr::null()) };
         assert_eq!(result, 0, "failed to load dll");
@@ -222,34 +252,37 @@ impl Hostfxr {
     }
 }
 
-enum Level {
+#[derive(serde::Deserialize)]
+enum Severity {
     Warning,
     Error,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all="PascalCase")]
 struct Diagnostic {
-    pub file: PathBuf,
+    pub filename: PathBuf,
     pub line: usize,
     pub column: usize,
-    pub level: Level,
+    pub severity: Severity,
     pub code: String,
     pub message: String,
 }
 impl Diagnostic {
     pub fn log(&self) {
-        match self.level {
-            Level::Warning => log::warn!(
+        match self.severity {
+            Severity::Warning => log::warn!(
                 "[msbuild {}] {} {},{}: {}",
                 self.code,
-                self.file.file_name().unwrap().to_string_lossy(),
+                self.filename.file_name().unwrap().to_string_lossy(),
                 self.line,
                 self.column,
                 self.message
             ),
-            Level::Error => log::error!(
+            Severity::Error => log::error!(
                 "[msbuild {}] {} {},{}: {}",
                 self.code,
-                self.file.file_name().unwrap().to_string_lossy(),
+                self.filename.file_name().unwrap().to_string_lossy(),
                 self.line,
                 self.column,
                 self.message
@@ -257,26 +290,75 @@ impl Diagnostic {
         }
     }
 
+    #[allow(dead_code)]
     pub fn log_with_base(&self, base: &Path) {
         let base = dunce::canonicalize(base).unwrap();
-        match self.level {
-            Level::Warning => log::warn!(
+        match self.severity {
+            Severity::Warning => log::warn!(
                 "[msbuild {}] {} {},{}: {}",
                 self.code,
-                self.file.strip_prefix(base).unwrap_or(&self.file).display(),
+                self.filename.strip_prefix(base).unwrap_or(&self.filename).display(),
                 self.line,
                 self.column,
                 self.message
             ),
-            Level::Error => log::error!(
+            Severity::Error => log::error!(
                 "[msbuild {}] {} {},{}: {}",
                 self.code,
-                self.file.strip_prefix(base).unwrap_or(&self.file).display(),
+                self.filename.strip_prefix(base).unwrap_or(&self.filename).display(),
                 self.line,
                 self.column,
                 self.message
             ),
         }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all="PascalCase")]
+struct BuildResponse {
+    elapsed_ms: usize,
+    diagnostics: Vec<Diagnostic>,
+}
+
+struct DotnetBuilder {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+impl DotnetBuilder {
+    pub fn new(dotnet: PathBuf, builder_dll: &Path) -> std::io::Result<Self> {
+        let mut child = std::process::Command::new(dotnet)
+            .arg("exec")
+            .arg(builder_dll)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+
+        Ok(Self { child, stdin, stdout })
+    }
+
+    pub fn build(&mut self, project_file: &Path, out_file: &Path) -> std::io::Result<BuildResponse> {
+        writeln!(
+            self.stdin,
+            "{{\"ProjectFile\": \"{}\", \"OutFile\": \"{}\"}}",
+            project_file.display().to_string().replace("\\", "\\\\"),
+            out_file.display().to_string().replace("\\", "\\\\"),
+        )?;
+        self.stdin.flush()?;
+
+        let mut response = String::new();
+        self.stdout.read_line(&mut response)?;
+        serde_json::from_str(&response)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    }
+}
+impl Drop for DotnetBuilder {
+    fn drop(&mut self) {
+        _ = self.child.kill();
     }
 }
 
@@ -313,6 +395,8 @@ pub struct Runtime {
 
     host: Hostfxr,
     managed: RuntimeManaged,
+    #[cfg(not(feature="distribute"))]
+    builder: DotnetBuilder,
 
     scope: Option<Scope>,
 }
@@ -394,7 +478,7 @@ impl Runtime {
                     "hostfxr.dylib"
                 }
             }),
-            managed: PathBuf::from("assets/scripts"),
+            managed: config.managed.clone().unwrap_or(PathBuf::from("assets")),
         };
 
         log::debug!("Paths:");
@@ -404,13 +488,15 @@ impl Runtime {
         log::debug!("    dll: {}", paths.dll.display());
         log::debug!("    managed: {}", paths.managed.display());
 
-        // TODO: Research whether this can be done once when packaging for
-        //  production (Release)
-        #[cfg(debug_assertions)]
+        #[cfg(not(feature="distribute"))]
+        let builder_path = Self::ensure_builder(&versions, &paths);
+
+        #[cfg(not(feature="distribute"))]
         Self::ensure_runtime(&versions, &paths);
 
         let host = Hostfxr::new(&paths);
 
+        log::debug!("[bind] Runtime.dll methods");
         Self {
             managed: unsafe {
                 RuntimeManaged {
@@ -431,6 +517,21 @@ impl Runtime {
                     )),
                 }
             },
+            #[cfg(not(feature="distribute"))]
+            builder: DotnetBuilder::new(
+                {
+                    #[cfg(target_os = "windows")]
+                    {
+                        paths.dotnet.join("dotnet.exe")
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        paths.dotnet.join("dotnet")
+                    }
+                },
+                // TODO: download and resolve dll
+                &builder_path
+            ).unwrap(),
             host,
             paths,
             versions,
@@ -438,9 +539,92 @@ impl Runtime {
         }
     }
 
+    #[cfg(not(feature="distribute"))]
+    fn ensure_builder(versions: &RuntimeVersions, paths: &RuntimePaths) -> PathBuf {
+        let builder_dir = std::env::current_dir().unwrap().join("target").join("builder");
+        let builder_cs = builder_dir.join("Builder.cs");
+        let builder_csproj = builder_dir.join("Builder.csproj");
+        let builder_dll = builder_dir.join(".bin").join("Builder.dll");
+
+        if !builder_dll.exists() {
+            if !builder_dir.exists() {
+                std::fs::create_dir(&builder_dir).unwrap();
+            }
+
+            std::fs::write(
+                &builder_csproj,
+                format_builder_csproj(&versions.net, &versions.framework),
+            )
+                .unwrap();
+
+            std::fs::write(
+                &builder_cs,
+                BUILDER_CS,
+            )
+                .unwrap();
+
+            let now = std::time::Instant::now();
+            let build_log = builder_dir.join("build.log");
+            let result = std::process::Command::new({
+                #[cfg(target_os = "windows")]
+                {
+                    paths.dotnet.join("dotnet.exe")
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    paths.dotnet.join("dotnet")
+                }
+            })
+                .arg("build")
+                .arg(&builder_csproj)
+                .args(["-c", "Release"])
+                .arg(format!("/flp:v=q;logfile={}", build_log.display()))
+                .arg("-o")
+                .arg(builder_dir.join(".bin"))
+                .arg(r#"/p:BaseIntermediateOutputPath=".obj/""#)
+                .output()
+                .unwrap();
+
+            log::debug!("[compile] {} {:.3} s", builder_csproj.display(), now.elapsed().as_secs_f64());
+
+            if !result.status.success() {
+                panic!("failed to build dotnet builder");
+            }
+
+            if build_log.exists() {
+                let diag = std::fs::read_to_string(&build_log).unwrap();
+                let pattern = regex::Regex::new(
+                    r"(.+)\((\d+),(\d+)\): (warning|error) (CS\d+): (.+) \[[^\]]+\]",
+                )
+                .unwrap();
+
+                diag.lines()
+                    .filter_map(|v| pattern.captures(v))
+                    .for_each(|v| {
+                        Diagnostic {
+                            filename: PathBuf::from(v[1].to_string()),
+                            line: v[2].parse::<usize>().unwrap(),
+                            column: v[3].parse::<usize>().unwrap(),
+                            severity: match &v[4] {
+                                "warning" => Severity::Warning,
+                                _ => Severity::Error,
+                            },
+                            code: v[5].into(),
+                            message: v[6].into(),
+                        }
+                        .log()
+                    });
+            }
+        }
+
+        builder_dll
+    }
+
+    #[cfg(not(feature="distribute"))]
     fn ensure_runtime(versions: &RuntimeVersions, paths: &RuntimePaths) {
         let runtime_dir = std::env::current_dir().unwrap().join("target").join("runtime");
         let runtime_csproj = runtime_dir.join("Runtime.csproj");
+        
         let runtimeconfig_bin = runtime_dir
             .join(".bin")
             .join("Runtime.runtimeconfig.json");
@@ -450,7 +634,7 @@ impl Runtime {
         let runtime_cs = runtime_dir.join("Runtime.cs");
 
         #[cfg(not(feature = "always-build-runtime"))]
-        let needs_rebuils = !runtime_dll_bin.exists()
+        let needs_rebuild = !runtime_dll_bin.exists()
             || !runtimeconfig_bin.exists()
             || !runtime_csproj.exists()
             || !std::fs::read_to_string(&runtime_csproj)
@@ -473,21 +657,13 @@ impl Runtime {
             )
                 .unwrap();
 
-            #[cfg(feature = "download-runtime")]
-            if !runtime_cs.exists() {
-                let mut result = ureq::get("https://raw.githubusercontent.com/Tired-Fox/bevy_cs_managed/refs/heads/master/Runtime.cs")
-                    .call()
-                    .unwrap();
+            std::fs::write(
+                &runtime_cs,
+                RUNTIME_CS,
+            )
+                .unwrap();
 
-                std::fs::write(&runtime_cs, result.body_mut().read_to_string().unwrap()).unwrap();
-            }
-            #[cfg(not(feature = "download-runtime"))]
-            if !runtime_cs.exists() {
-                panic!("missing Runtime.cs file. Can be found at https://github.com/Tired-Fox/bevy_cs_managed/blob/master/Runtime.cs");
-            }
-
-            log::debug!("compiling {}", runtime_csproj.display());
-
+            let now = std::time::Instant::now();
             let build_log = runtime_dir.join("build.log");
             let result = std::process::Command::new({
                 #[cfg(target_os = "windows")]
@@ -496,18 +672,20 @@ impl Runtime {
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
-                    dotnet_path.join("dotnet")
+                    paths.dotnet.join("dotnet")
                 }
             })
-            .arg("build")
-            .arg(&runtime_csproj)
-            .args(["-c", "Release"])
-            .arg(format!("/flp:v=q;logfile={}", build_log.display()))
-            .arg("-o")
-            .arg(runtime_dir.join(".bin"))
-            .arg(r#"/p:BaseIntermediateOutputPath=".obj/""#)
-            .output()
-            .unwrap();
+                .arg("build")
+                .arg(&runtime_csproj)
+                .args(["-c", "Release"])
+                .arg(format!("/flp:v=q;logfile={}", build_log.display()))
+                .arg("-o")
+                .arg(runtime_dir.join(".bin"))
+                .arg(r#"/p:BaseIntermediateOutputPath=".obj/""#)
+                .output()
+                .unwrap();
+
+            log::debug!("[compile] {} {:.3} s", runtime_csproj.display(), now.elapsed().as_secs_f64());
 
             if !result.status.success() {
                 panic!("failed to build runtime api");
@@ -524,12 +702,12 @@ impl Runtime {
                     .filter_map(|v| pattern.captures(v))
                     .for_each(|v| {
                         Diagnostic {
-                            file: PathBuf::from(v[1].to_string()),
+                            filename: PathBuf::from(v[1].to_string()),
                             line: v[2].parse::<usize>().unwrap(),
                             column: v[3].parse::<usize>().unwrap(),
-                            level: match &v[4] {
-                                "warning" => Level::Warning,
-                                _ => Level::Error,
+                            severity: match &v[4] {
+                                "warning" => Severity::Warning,
+                                _ => Severity::Error,
                             },
                             code: v[5].into(),
                             message: v[6].into(),
@@ -538,18 +716,18 @@ impl Runtime {
                     });
             }
 
-            log::debug!("copying Runtime.runtimeconfig.json to output");
+            log::debug!("[copy] {} to {}", runtimeconfig_bin.display(), paths.config.display());
             std::fs::copy(&runtimeconfig_bin, &paths.config).unwrap();
-            log::debug!("copying Runtime.dll to output");
+            log::debug!("[copy] {} to {}", runtime_dll_bin.display(), paths.dll.display());
             std::fs::copy(&runtime_dll_bin, &paths.dll).unwrap();
         } else {
             if !paths.config.exists() {
-                log::debug!("copying Runtime.runtimeconfig.json to output");
+                log::debug!("[copy] {} to {}", runtimeconfig_bin.display(), paths.config.display());
                 std::fs::copy(&runtimeconfig_bin, &paths.config).unwrap();
             }
 
             if !paths.dll.exists() {
-                log::debug!("copying Runtime.dll to output");
+                log::debug!("[copy] {} to {}", runtime_dll_bin.display(), paths.dll.display());
                 std::fs::copy(&runtime_dll_bin, &paths.dll).unwrap();
             }
         }
@@ -583,128 +761,36 @@ impl Runtime {
         &self.versions.net
     }
 
-    pub fn build_engine(&self, target_dir: &Path) {
+    #[cfg(not(feature="distribute"))]
+    pub fn build_engine(&mut self, target_dir: &Path) {
         let engine_path = self.get_managed_path().join("engine");
         let engine_csproj = engine_path.join("Engine.csproj");
-        let engine_dll_bin = engine_path.join(".bin").join("Engine.dll");
-        let build_log = engine_path.join("build.log");
-
-        let result = std::process::Command::new({
-            #[cfg(target_os = "windows")]
-            {
-                self.get_dotnet_path().join("dotnet.exe")
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                self.get_dotnet_path().join("dotnet")
-            }
-        })
-            .arg("build")
-            .arg(&engine_csproj)
-            .args(["-c", "Release"])
-            .arg(format!("/flp:v=q;logfile={}", build_log.display()))
-            .arg("-o")
-            .arg(engine_path.join(".bin"))
-            .arg(r#"/p:BaseIntermediateOutputPath=".obj/""#)
-            .output()
-            .unwrap();
-
-        if build_log.exists() {
-            let diag = std::fs::read_to_string(&build_log).unwrap();
-            let pattern = regex::Regex::new(
-                r"(.+)\((\d+),(\d+)\): (warning|error) (CS\d+): (.+) \[[^\]]+\]",
-            )
-            .unwrap();
-
-            diag.lines()
-                .filter_map(|v| pattern.captures(v))
-                .for_each(|v| {
-                    Diagnostic {
-                        file: PathBuf::from(v[1].to_string()),
-                        line: v[2].parse::<usize>().unwrap(),
-                        column: v[3].parse::<usize>().unwrap(),
-                        level: match &v[4] {
-                            "warning" => Level::Warning,
-                            _ => Level::Error,
-                        },
-                        code: v[5].into(),
-                        message: v[6].into(),
-                    }
-                    .log_with_base(self.get_managed_path())
-                });
-        }
-
-        if !result.status.success() {
-            panic!("failed to build engine api");
-        }
 
         if !target_dir.join("managed").exists() {
             std::fs::create_dir_all(target_dir.join("managed")).unwrap();
         }
 
-        std::fs::copy(&engine_dll_bin, target_dir.join("managed").join("Engine.dll")).unwrap();
+        let result = self.builder.build(&engine_csproj, &target_dir.join("managed").join("Engine.dll")).unwrap();
+        log::debug!("[compile] Engine API in {:.3} s", result.elapsed_ms as f64 / 1000.0);
+        for d in result.diagnostics {
+            d.log_with_base(&engine_path);
+        }
     }
 
-    pub fn build_scripts(&self, target_dir: &Path) {
-        let managed_path = self.get_managed_path();
-        let managed_csproj = managed_path.join("Scripts.csproj");
-        let managed_dll_bin = managed_path.join(".bin").join("Scripts.dll");
-        let build_log = managed_path.join("build.log");
-
-        let result = std::process::Command::new({
-            #[cfg(target_os = "windows")]
-            {
-                self.get_dotnet_path().join("dotnet.exe")
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                self.get_dotnet_path().join("dotnet")
-            }
-        })
-            .arg("build")
-            .arg(&managed_csproj)
-            .args(["-c", "Release"])
-            .arg(format!("/flp:v=q;logfile={}", build_log.display()))
-            .arg("-o")
-            .arg(managed_path.join(".bin"))
-            .arg(r#"/p:BaseIntermediateOutputPath=".obj/""#)
-            .output()
-            .unwrap();
-
-        if build_log.exists() {
-            let diag = std::fs::read_to_string(&build_log).unwrap();
-            let pattern = regex::Regex::new(
-                r"(.+)\((\d+),(\d+)\): (warning|error) (CS\d+): (.+) \[[^\]]+\]",
-            )
-            .unwrap();
-
-            diag.lines()
-                .filter_map(|v| pattern.captures(v.trim()))
-                .for_each(|v| {
-                    Diagnostic {
-                        file: PathBuf::from(v[1].to_string()),
-                        line: v[2].parse::<usize>().unwrap(),
-                        column: v[3].parse::<usize>().unwrap(),
-                        level: match &v[4] {
-                            "warning" => Level::Warning,
-                            _ => Level::Error,
-                        },
-                        code: v[5].into(),
-                        message: v[6].into(),
-                    }
-                    .log_with_base(managed_path)
-                });
-        }
-
-        if !result.status.success() {
-            panic!("failed to build scripts api");
-        }
+    #[cfg(not(feature="distribute"))]
+    pub fn build_scripts(&mut self, target_dir: &Path) {
+        let scripts_path = self.get_managed_path().join("scripts");
+        let scripts_csproj = scripts_path.join("Scripts.csproj");
 
         if !target_dir.join("managed").exists() {
             std::fs::create_dir_all(target_dir.join("managed")).unwrap();
         }
 
-        std::fs::copy(&managed_dll_bin, target_dir.join("managed").join("Scripts.dll")).unwrap();
+        let result = self.builder.build(&scripts_csproj, &target_dir.join("managed").join("Scripts.dll")).unwrap();
+        log::debug!("[compile] Scripts in {:.3} s", result.elapsed_ms as f64 / 1000.0);
+        for d in result.diagnostics {
+            d.log_with_base(&scripts_path);
+        }
     }
 
     pub fn ping(&self) -> bool {
@@ -792,9 +878,10 @@ impl Default for Version {
     }
 }
 
+#[derive(Default)]
 pub struct CSharpScripting {
     pub version: Version,
-    pub managed: PathBuf,
+    pub managed: Option<PathBuf>,
 }
 
 impl bevy::app::Plugin for CSharpScripting {
@@ -808,23 +895,28 @@ fn setup(mut runtime: bevy::prelude::ResMut<Runtime>) {
     assert!(runtime.ping(), "failed to bind and initialize C# Runtime");
     runtime.scope = Some(runtime.create_scope());
 
-    if !runtime.get_managed_path().exists() {
-        std::fs::create_dir_all(runtime.get_managed_path()).unwrap();
+    #[cfg(not(feature="distribute"))]
+    {
+        if !runtime.get_managed_path().exists() {
+            std::fs::create_dir_all(runtime.get_managed_path()).unwrap();
+        }
+
+        let engine_path = runtime.get_managed_path().join("engine");
+        if !engine_path.exists() {
+            std::fs::create_dir_all(&engine_path).unwrap();
+        }
+        std::fs::write(engine_path.join("Engine.csproj"), format_engine_csproj(runtime.get_net_version(), runtime.get_framework_version())).unwrap();
+
+        let scripts_path = runtime.get_managed_path().join("scripts");
+        if !scripts_path.exists() {
+            std::fs::create_dir_all(&engine_path).unwrap();
+        }
+        std::fs::write(scripts_path.join("Scripts.csproj"), format_scripts_csproj(runtime.get_net_version(), runtime.get_framework_version())).unwrap();
+
+        let exe_dir = std::env::current_exe().unwrap();
+        let exe_dir = exe_dir.parent().unwrap();
+
+        runtime.build_engine(exe_dir);
+        runtime.build_scripts(exe_dir);
     }
-
-    let engine_path = runtime.get_managed_path().join("engine");
-    if !engine_path.exists() {
-        std::fs::create_dir_all(&engine_path).unwrap();
-    }
-
-    std::fs::write(engine_path.join("Engine.csproj"), format_engine_csproj(runtime.get_net_version(), runtime.get_framework_version())).unwrap();
-    std::fs::write(runtime.get_managed_path().join("Scripts.csproj"), format_managed_csproj(runtime.get_net_version(), runtime.get_framework_version())).unwrap();
-
-    let exe_dir = std::env::current_exe().unwrap();
-    let exe_dir = exe_dir.parent().unwrap();
-
-    log::info!("compiling Engine API");
-    runtime.build_engine(exe_dir);
-    log::info!("compiling Scripts");
-    runtime.build_scripts(exe_dir);
 }

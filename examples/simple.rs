@@ -13,9 +13,6 @@ fn main() {
             custom_layer: |_| None,
             fmt_layer: |_| None,
         })
-        .add_plugins(CSharpScripting {
-            version: Default::default(),
-            managed: "examples/assets".into(),
-        })
+        .add_plugins(CSharpScripting::default())
         .run();
 }

@@ -30,7 +30,9 @@ mobile and web, or making it compatible with [Mono](https://www.mono-project.com
 
 ### Examples
 
-1. Simple: `cargo run --example=simple --features=download-runtime`
+1. Simple:
+    - `cargo run --example simple` **WITH** dynamically compiled `.cs` files
+    - `cargo run --example simple -F distribute` **WITHOUT** dynamically compiled `.cs` files
 
 ### Todo
 
@@ -44,18 +46,25 @@ mobile and web, or making it compatible with [Mono](https://www.mono-project.com
     - [ ] Optimal memory management.
         - Is `GCHandle.Alloc` with `GCHandle.Free` on `Drop` good enough?
         - Is it better to find a way to make the data returned raw pointers which can be pinned with the runtime api similar to Mono?
-- [x] Compile runtime based on the users installed .Net
-- [x] `download-runtime` feature to automatically download Runetime.cs if missing
-- [x] Bind runtime based on the users installed .Net
+- [x] Compiled runtime dll
+    - [ ] Compiled once for the given .Net version
+- [x] Child process for cached and continuous dotnet builds
+    - [ ] Compiled once for the given .Net version
+    - First compile job is the slowest as it loads all the dependencies
+    - Subsequent builds are much faster than `dotnet build`
+    - Isolated from system environements like `dotnet build-server`
+    - Output build diagnostics as json for easy formatting
+    - Accurate elapsed build times
+- [ ] Bind runtime
 - [ ] Bind interop functions
 - [ ] Bind interop data
 - [ ] Generate Engine API bindings
 - [ ] Compile Engine API
-    - [x] Compile and Copy dll
+    - [x] Compile dll to `target` directory
     - [ ] Gracefully handle errors
 - [ ] Load Engine API
 - [ ] Compile user scripts
-    - [x] Compile and Copy dll
+    - [x] Compile dll to `target` directory
     - [ ] Gracefully handle errors
 - [ ] Load user Scripts
 - [ ] Bind user script methods to hooks
