@@ -119,5 +119,23 @@ fn setup(mut runtime: bevy::prelude::ResMut<Runtime>) {
             exe_dir.join("managed").join(format!("{name}.dll")),
         )
         .unwrap();
+
+        let _engine_asm = runtime.load_from_path(runtime.scope.as_ref().unwrap(), exe_dir.join("managed").join("Engine.dll")).expect("failed to load Engine.dll");
+
+        let scripts_asm = runtime.load_from_path(runtime.scope.as_ref().unwrap(), exe_dir.join("managed").join(format!("{name}.dll")));
+        if let Some(assembly) = scripts_asm.as_ref() {
+             if let Some(player) = runtime.get_class(assembly, "Player").as_ref() {
+                 let instance = runtime.new_object(player).expect("failed to create a new player class");
+                 if let Some(awake) = runtime.get_method(player, "Awake", 0).as_ref() {
+                     runtime.invoke(awake, Some(&instance), &[]);
+                 }
+
+                 if let Some(update) = runtime.get_method(player, "Update", 1).as_ref() {
+                     let dt = 0.016f32;
+                     runtime.invoke(update, Some(&instance), &[(&raw const dt).cast()]);
+                     runtime.invoke(update, Some(&instance), &[(&raw const dt).cast()]);
+                 }
+             }
+        }
     }
 }

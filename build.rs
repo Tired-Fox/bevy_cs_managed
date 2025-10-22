@@ -1,11 +1,13 @@
 use std::{path::PathBuf, sync::Once};
 
+use log::{Metadata, Record};
+
 #[path = "src/config.rs"]
 mod config;
+use config::{Config, Version};
+
 #[path = "src/dotnet/mod.rs"]
 mod dotnet;
-use config::{Config, Version};
-use log::{Metadata, Record};
 
 static RUNTIME_CS: &[u8] = include_bytes!("Runtime.cs");
 
@@ -20,9 +22,6 @@ struct Paths {
 
 fn main() {
     init_build_logger();
-
-    println!("cargo::rerun-if-changed=target/runtime");
-    println!("cargo::rerun-if-changed=managed.config.json");
 
     let output = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not bound"));
     let constants = output.join("constants.rs");

@@ -1,4 +1,4 @@
-use std::{ffi::c_void, sync::Arc};
+use std::sync::Arc;
 
 use hostfxr_sys::{
     dlopen2::wrapper::Container, get_function_pointer_fn, hostfxr_delegate_type, hostfxr_handle,
@@ -119,22 +119,9 @@ impl Hostfxr {
         };
         assert_eq!(
             result, 0,
-            "hostfxr failed to fetch dll function with delegate"
+            "hostfxr failed to fetch dll function with delegate: 0x{:X}",
+            result
         );
         delegate
-    }
-}
-
-pub struct Scope {
-    inner: *const c_void,
-}
-
-impl Scope {
-    pub fn new(inner: *const c_void) -> Self {
-        Self { inner }
-    }
-
-    pub fn as_ptr(&self) -> *const c_void {
-        self.inner
     }
 }
