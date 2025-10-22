@@ -9,10 +9,9 @@ public class Player {
     }
 
     void Update(float dt) {
-        Console.WriteLine($"[C#] Delta Time: {dt}");
-        Position.x += dt;
-        Position.y += dt;
-        Position.z += dt;
+        Position.x = (Position.x + dt) % 5;
+        Position.y = (Position.y + dt) % 5;
+        Position.z = (Position.z + dt) % 5;
         Console.WriteLine($"[C#] Update: <{Position.x}, {Position.y}, {Position.z}>");
     }
 }

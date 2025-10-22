@@ -1,6 +1,8 @@
-use std::{ffi::c_void, path::{Path, PathBuf}};
+use std::{
+    borrow::Cow, cell::RefCell, collections::{hash_map::Entry, HashMap}, ffi::c_void, path::{Path, PathBuf}, rc::Rc
+};
 
-use bevy::ecs::resource::Resource;
+use bevy::{ecs::resource::Resource};
 
 use crate::{dotnet, hostfxr::Hostfxr};
 
@@ -26,16 +28,27 @@ pub struct Managed {
     pub(crate) destroy: Destroy,
 
     pub(crate) create_scope: unsafe extern "system" fn(*const c_void, *mut *const c_void) -> i32,
-    pub(crate) load_from_path: unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void) -> i32,
+    pub(crate) load_from_path:
+        unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void) -> i32,
     pub(crate) unload_scope: unsafe extern "system" fn(*const c_void) -> i32,
 
-    pub(crate) get_class: unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void) -> i32,
+    pub(crate) get_class:
+        unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void) -> i32,
 
     pub(crate) new: unsafe extern "system" fn(*const c_void, *mut *const c_void) -> i32,
-    pub(crate) is_assignable_from: unsafe extern "system" fn(*const c_void, *const c_void, *mut i32) -> i32,
-    pub(crate) get_method: unsafe extern "system" fn(*const c_void, *const c_void, i32, *mut *const c_void) -> i32,
+    pub(crate) is_assignable_from:
+        unsafe extern "system" fn(*const c_void, *const c_void, *mut i32) -> i32,
+    pub(crate) get_method:
+        unsafe extern "system" fn(*const c_void, *const c_void, i32, *mut *const c_void) -> i32,
 
-    pub(crate) runtime_invoke: unsafe extern "system" fn(*const c_void, *const c_void, *const *const c_void) -> i32,
+    pub(crate) runtime_invoke:
+        unsafe extern "system" fn(*const c_void, *const c_void, *const *const c_void) -> i32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AssemblyType {
+    Engine,
+    Scripts,
 }
 
 /// # Saftey
@@ -50,6 +63,46 @@ pub struct Runtime {
     managed: Managed,
 
     pub scope: Option<Scope>,
+    pub assemblies: HashMap<AssemblyType, Assembly>,
+
+    pub fullname_to_script: HashMap<Cow<'static, str>, usize>,
+    pub scripts: Vec<Rc<RefCell<Script>>>,
+}
+
+// TODO: Add Reflect which fetches cached public fields
+pub struct Script {
+    pub(crate) name: Cow<'static, str>,
+    pub(crate) class: Class,
+
+    pub(crate) methods: HashMap<(String, i32), Rc<Method>>,
+}
+impl Script {
+    pub fn get_method(
+        &mut self,
+        runtime: &Runtime,
+        name: impl std::fmt::Display,
+        args: i32,
+    ) -> Option<Rc<Method>> {
+        match self.methods.entry((name.to_string(), args)) {
+            Entry::Occupied(entry) => Some(entry.get().clone()),
+            Entry::Vacant(entry) => {
+                let method = Rc::new(runtime.get_method(&self.class, &entry.key().0, args)?);
+                entry.insert(method.clone());
+                Some(method)
+            }
+        }
+    }
+}
+
+#[derive(bevy::prelude::Component)]
+pub struct Instance {
+    pub(crate) index: usize,
+    pub(crate) instance: Object,
+}
+impl AsRef<Object> for Instance {
+    fn as_ref(&self) -> &Object {
+        &self.instance
+    }
 }
 
 // Bevy garuntees that one system at a time is using the resource.
@@ -175,7 +228,35 @@ impl Runtime {
             paths,
             versions,
             scope: None,
+
+            fullname_to_script: Default::default(),
+            assemblies: Default::default(),
+            scripts: Default::default(),
         }
+    }
+
+    /// Create a new instance of a class associated with a certain script index
+    pub fn create(&mut self, name: impl AsRef<str>) -> Result<Instance, String> {
+        if let Some(index) = self.fullname_to_script.get(name.as_ref()).copied() {
+            let script = self.scripts[index].borrow();
+            let instance = self.new_object(&script.class).ok_or(format!("failed to initialize script class: {}", script.name))?;
+            Ok(Instance { index, instance })
+        } else {
+            let scripts_asm = self.assemblies.get(&AssemblyType::Scripts).unwrap();
+            let class = self.get_class(scripts_asm, name.as_ref()).ok_or(format!("unknown class: {}", name.as_ref()))?;
+            let name: Cow<'static, str> = name.as_ref().to_string().into();
+            let index = self.scripts.len();
+            self.fullname_to_script.insert(name.clone(), index);
+            self.scripts.push(Rc::new(RefCell::new(Script { name, class, methods: Default::default() })));
+
+            let script = self.scripts[index].borrow();
+            let instance = self.new_object(&script.class).ok_or(format!("failed to initialize script class: {}", script.name))?;
+            Ok(Instance { index, instance })
+        }
+    }
+
+    pub fn get_script(&self, instance: &Instance) -> Option<Rc<RefCell<Script>>> {
+        self.scripts.get(instance.index).cloned()
     }
 
     pub fn get_config_path(&self) -> &Path {
@@ -221,28 +302,49 @@ impl Runtime {
 
     pub fn load_from_path(&self, scope: &Scope, path: impl AsRef<Path>) -> Option<Assembly> {
         let mut path = path.as_ref().display().to_string();
-        if !path.ends_with('\0') { path.push('\0'); }
+        if !path.ends_with('\0') {
+            path.push('\0');
+        }
 
         let mut out: *const c_void = std::ptr::null();
         // TODO: Error handling
-        unsafe { (self.managed.load_from_path)(scope.as_ptr(), path.as_ptr().cast(), &raw mut out) };
-        (!out.is_null()).then_some(Assembly::new(out))
+        unsafe {
+            (self.managed.load_from_path)(scope.as_ptr(), path.as_ptr().cast(), &raw mut out)
+        };
+
+        if out.is_null() {
+            None
+        } else {
+            Some(Assembly::new(out))
+        }
     }
 
     pub fn get_class(&self, assembly: &Assembly, name: impl std::fmt::Display) -> Option<Class> {
         let mut name = name.to_string();
-        if !name.starts_with('\0') { name.push('\0'); }
+        if !name.starts_with('\0') {
+            name.push('\0');
+        }
         // TODO: Error handling
         let mut out: *const c_void = std::ptr::null();
         unsafe { (self.managed.get_class)(assembly.as_ptr(), name.as_ptr().cast(), &raw mut out) };
-        (!out.is_null()).then_some(Class::new(out, self.managed.destroy))
+
+        if out.is_null() {
+            None
+        } else {
+            Some(Class::new(out, self.managed.destroy))
+        }
     }
 
     pub fn new_object(&self, class: &Class) -> Option<Object> {
         // TODO: Error handling
         let mut out: *const c_void = std::ptr::null();
         unsafe { (self.managed.new)(class.as_ptr(), &raw mut out) };
-        (!out.is_null()).then_some(Object::new(out, self.managed.destroy))
+
+        if out.is_null() {
+            None
+        } else {
+            Some(Object::new(out, self.managed.destroy))
+        }
     }
 
     pub fn is_assignable_from(&self, base: &Class, target: &Class) -> bool {
@@ -252,18 +354,40 @@ impl Runtime {
         out == 1
     }
 
-    pub fn get_method(&self, class: &Class, name: impl std::fmt::Display, args: i32) -> Option<Method> {
+    pub fn get_method(
+        &self,
+        class: &Class,
+        name: impl std::fmt::Display,
+        args: i32,
+    ) -> Option<Method> {
         let mut name = name.to_string();
-        if !name.starts_with('\0') { name.push('\0'); }
+        if !name.starts_with('\0') {
+            name.push('\0');
+        }
         // TODO: Error handling
         let mut out: *const c_void = std::ptr::null();
-        unsafe { (self.managed.get_method)(class.as_ptr(), name.as_ptr().cast(), args, &raw mut out) };
-        (!out.is_null()).then_some(Method::new(out, self.managed.destroy))
+        unsafe {
+            (self.managed.get_method)(class.as_ptr(), name.as_ptr().cast(), args, &raw mut out)
+        };
+
+        if out.is_null() {
+            None
+        } else {
+            Some(Method::new(out, self.managed.destroy))
+        }
     }
 
     pub fn invoke(&self, method: &Method, instance: Option<&Object>, args: &[*const c_void]) {
         // TODO: Error handling
-        unsafe { (self.managed.runtime_invoke)(method.as_ptr(), instance.map(|v| v.as_ptr().cast()).unwrap_or(std::ptr::null()), args.as_ptr()) };
+        unsafe {
+            (self.managed.runtime_invoke)(
+                method.as_ptr(),
+                instance
+                    .map(|v| v.as_ptr().cast())
+                    .unwrap_or(std::ptr::null()),
+                args.as_ptr(),
+            )
+        };
     }
 }
 
@@ -349,6 +473,8 @@ pub struct Object {
     inner: *const c_void,
     destroy: Destroy,
 }
+unsafe impl Send for Object {}
+unsafe impl Sync for Object {}
 impl Object {
     fn new(inner: *const c_void, destroy: Destroy) -> Self {
         Self { inner, destroy }

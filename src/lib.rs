@@ -1,12 +1,15 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 mod config;
+use bevy::ecs::system::Query;
 use config::Version;
 
 mod hostfxr;
 
 pub mod runtime;
 use runtime::Runtime;
+
+use crate::runtime::{AssemblyType, Instance};
 
 pub mod dotnet;
 
@@ -62,80 +65,99 @@ pub struct CSharpScripting {
 
 impl bevy::app::Plugin for CSharpScripting {
     fn build(&self, app: &mut bevy::app::App) {
-        app.insert_resource(Runtime::new());
-        app.add_systems(bevy::prelude::Startup, setup);
-    }
-}
-
-fn setup(mut runtime: bevy::prelude::ResMut<Runtime>) {
-    assert!(runtime.ping(), "failed to bind and initialize C# Runtime");
-    runtime.scope = Some(runtime.create_scope());
-
-    #[cfg(debug_assertions)]
-    {
-        if !runtime.get_managed_path().exists() {
-            std::fs::create_dir_all(runtime.get_managed_path()).unwrap();
-        }
-
-        let engine_path = runtime.get_managed_path().join("engine");
-        if !engine_path.exists() {
-            std::fs::create_dir_all(&engine_path).unwrap();
-        }
-        std::fs::write(
-            engine_path.join("Engine.csproj"),
-            format_engine_csproj(runtime.get_net_version(), runtime.get_framework_version()),
-        )
-        .unwrap();
-
-        let scripts_path = runtime.get_managed_path().join("scripts");
-        if !scripts_path.exists() {
-            std::fs::create_dir_all(&engine_path).unwrap();
-        }
-        std::fs::write(
-            scripts_path.join("Scripts.csproj"),
-            format_scripts_csproj(runtime.get_net_version(), runtime.get_framework_version()),
-        )
-        .unwrap();
-
         let exe_dir = std::env::current_exe().unwrap();
         let exe_dir = exe_dir.parent().unwrap();
 
-        let builder = dotnet::Builder::new(runtime.get_dotnet_path(), runtime.get_net_version());
+        let mut runtime = Runtime::new();
 
-        if !exe_dir.join("managed").exists() {
-            std::fs::create_dir_all(exe_dir.join("managed")).unwrap();
+        assert!(runtime.ping(), "failed to bind and initialize C# Runtime");
+        runtime.scope = Some(runtime.create_scope());
+
+        #[cfg(debug_assertions)]
+        {
+            if !runtime.get_managed_path().exists() {
+                std::fs::create_dir_all(runtime.get_managed_path()).unwrap();
+            }
+
+            let engine_path = runtime.get_managed_path().join("engine");
+            if !engine_path.exists() {
+                std::fs::create_dir_all(&engine_path).unwrap();
+            }
+            std::fs::write(
+                engine_path.join("Engine.csproj"),
+                format_engine_csproj(runtime.get_net_version(), runtime.get_framework_version()),
+            )
+            .unwrap();
+
+            let scripts_path = runtime.get_managed_path().join("scripts");
+            if !scripts_path.exists() {
+                std::fs::create_dir_all(&engine_path).unwrap();
+            }
+            std::fs::write(
+                scripts_path.join("Scripts.csproj"),
+                format_scripts_csproj(runtime.get_net_version(), runtime.get_framework_version()),
+            )
+            .unwrap();
+
+            let builder = dotnet::Builder::new(runtime.get_dotnet_path(), runtime.get_net_version());
+
+            if !exe_dir.join("managed").exists() {
+                std::fs::create_dir_all(exe_dir.join("managed")).unwrap();
+            }
+
+            let (name, base) = builder.build(engine_path.join("Engine.csproj")).unwrap();
+            std::fs::copy(
+                base.join(format!("{name}.dll")),
+                exe_dir.join("managed").join(format!("{name}.dll")),
+            )
+            .unwrap();
+
+            let (name, base) = builder.build(scripts_path.join("Scripts.csproj")).unwrap();
+            std::fs::copy(
+                base.join(format!("{name}.dll")),
+                exe_dir.join("managed").join(format!("{name}.dll")),
+            )
+            .unwrap();
         }
 
-        let (name, base) = builder.build(engine_path.join("Engine.csproj")).unwrap();
-        std::fs::copy(
-            base.join(format!("{name}.dll")),
-            exe_dir.join("managed").join(format!("{name}.dll")),
-        )
-        .unwrap();
+        runtime.assemblies = HashMap::from([
+            (
+                AssemblyType::Engine,
+                runtime
+                    .load_from_path(
+                        runtime.scope.as_ref().unwrap(),
+                        exe_dir.join("managed").join("Engine.dll"),
+                    )
+                    .expect("failed to load Engine.dll"),
+            ),
+            (
+                AssemblyType::Scripts,
+                runtime
+                    .load_from_path(
+                        runtime.scope.as_ref().unwrap(),
+                        exe_dir.join("managed").join("Scripts.dll"),
+                    )
+                    .expect("failed to load Scripts.dll"),
+            )
+        ]);
 
-        let (name, base) = builder.build(scripts_path.join("Scripts.csproj")).unwrap();
-        std::fs::copy(
-            base.join(format!("{name}.dll")),
-            exe_dir.join("managed").join(format!("{name}.dll")),
-        )
-        .unwrap();
+        app.insert_resource(runtime);
+        app.add_systems(bevy::prelude::Update, update);
+    }
+}
 
-        let _engine_asm = runtime.load_from_path(runtime.scope.as_ref().unwrap(), exe_dir.join("managed").join("Engine.dll")).expect("failed to load Engine.dll");
+fn update(
+    runtime: bevy::prelude::Res<Runtime>,
+    delta: bevy::prelude::Res<bevy::prelude::Time>,
+    query: Query<&Instance>,
+) {
+    let dt = delta.delta_secs();
 
-        let scripts_asm = runtime.load_from_path(runtime.scope.as_ref().unwrap(), exe_dir.join("managed").join(format!("{name}.dll")));
-        if let Some(assembly) = scripts_asm.as_ref() {
-             if let Some(player) = runtime.get_class(assembly, "Player").as_ref() {
-                 let instance = runtime.new_object(player).expect("failed to create a new player class");
-                 if let Some(awake) = runtime.get_method(player, "Awake", 0).as_ref() {
-                     runtime.invoke(awake, Some(&instance), &[]);
-                 }
-
-                 if let Some(update) = runtime.get_method(player, "Update", 1).as_ref() {
-                     let dt = 0.016f32;
-                     runtime.invoke(update, Some(&instance), &[(&raw const dt).cast()]);
-                     runtime.invoke(update, Some(&instance), &[(&raw const dt).cast()]);
-                 }
-             }
+    for instance in &query {
+        if let Some(script) = runtime.get_script(instance) {
+            if let Some(update) = script.borrow_mut().get_method(runtime.as_ref(), "Update", 1) {
+                runtime.invoke(&update, Some(instance.as_ref()), &[(&raw const dt).cast()]);
+            }
         }
     }
 }
