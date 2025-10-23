@@ -1,11 +1,27 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Text.Json;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
 using System.Text;
+
+class Field {
+    public string Name { get; set; } = default;
+    public bool IsStatic { get; set; }
+    public object[] CustomAttributes { get; set; } = default;
+}
+
+class Property {
+    public string Name { get; set; } = default;
+    public bool IsStatic { get; set; }
+    public object[] CustomAttributes { get; set; } = default;
+    public bool CanRead { get; set; }
+    public bool CanWrite { get; set; }
+}
 
 public sealed class Scope : AssemblyLoadContext
 {
@@ -52,7 +68,7 @@ public class Host
     public delegate void FreeDelegate(IntPtr ptr);
     public static void Free(IntPtr ptr)
     {
-        if (ptr != IntPtr.Zero) Marshal.FreeCoTaskMem(ptr);
+        if (ptr != IntPtr.Zero) Marshal.FreeHGlobal(ptr);
     }
 
     // ----- SCOPE -----
@@ -160,6 +176,47 @@ public class Host
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void GetMetaDataDelegate(IntPtr klass, out IntPtr result);
+    public static void GetMetaData(IntPtr klass, out IntPtr result)
+    {
+        var t = Ref<Type>(klass) ?? throw new ArgumentNullException("Class is null");
+
+        var fields = t.GetFields()
+            .Select(f => new Field {
+                Name = f.Name,
+                IsStatic = f.IsStatic,
+                CustomAttributes = f.GetCustomAttributes(false).ToArray()
+            })
+            .ToList();
+
+        var properties = t.GetProperties()
+            .Select(p => {
+                bool isStatic = (p.GetGetMethod(true)?.IsStatic ?? false) ||
+                    (p.GetSetMethod(true)?.IsStatic ?? false);
+
+                return new Property {
+                    Name = p.Name,
+                    IsStatic = isStatic,
+                    CustomAttributes = p.GetCustomAttributes(false).ToArray(),
+                    CanRead = p.CanRead,
+                    CanWrite = p.CanWrite,
+                };
+            })
+            .ToList();
+
+        string response = JsonSerializer.Serialize(new {
+            Fields = fields,
+            Properties = properties,
+        });
+
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(response);
+
+        result = Marshal.AllocHGlobal(bytes.Length + 1);
+        Marshal.Copy(bytes, 0, result, bytes.Length);
+        Marshal.WriteByte(result, bytes.Length, 0);
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void GetMethodDelegate(IntPtr klass, IntPtr nameUtf8Z, int argCount, out IntPtr result);
     public static void GetMethod(IntPtr klass, IntPtr name, int argCount, out IntPtr result)
     {
@@ -170,6 +227,23 @@ public class Host
         var cand = t.GetMethods(flags).Where(m => m.Name == methodName && m.GetParameters().Length == argCount).FirstOrDefault<MethodInfo>();
 
         result = cand == null ? IntPtr.Zero : Pin(cand);
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public unsafe delegate void SetFieldValueDelegate(IntPtr instance, IntPtr name, void* value);
+    public unsafe static void SetFieldValue(IntPtr instance, IntPtr name, void* value)
+    {
+        var target = Ref<object>(instance) ?? throw new ArgumentNullException();
+        var fieldName = ReadUtf8Z(name);
+        var flags = BindingFlags.Instance | BindingFlags.Public;
+
+        var fi = target.GetType().GetField(fieldName, flags) ?? throw new ArgumentNullException();
+        if (fi.IsStatic || (fi.Attributes & FieldAttributes.InitOnly) != 0) {
+            throw new ArgumentException("FieldNotFound");
+        }
+
+        var fv = ReadValueAsObject(value, fi.FieldType);
+        fi.SetValue(target, fv);
     }
 
     // ----- METHOD -----

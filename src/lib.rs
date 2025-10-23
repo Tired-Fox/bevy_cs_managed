@@ -1,15 +1,12 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::collections::HashMap;
 
 mod config;
-use bevy::ecs::system::Query;
-use config::Version;
 
 mod hostfxr;
 
 pub mod runtime;
-use runtime::Runtime;
-
-use crate::runtime::{AssemblyType, Instance};
+use runtime::AssemblyType;
+pub use runtime::{Script, Runtime};
 
 pub mod dotnet;
 
@@ -57,21 +54,17 @@ fn format_engine_csproj(net: &str, framework: &str) -> String {
     )
 }
 
-#[derive(Default)]
-pub struct CSharpScripting {
-    pub version: Version,
-    pub managed: Option<PathBuf>,
-}
+pub struct CSharpPlugin;
 
-impl bevy::app::Plugin for CSharpScripting {
+impl bevy::app::Plugin for CSharpPlugin {
     fn build(&self, app: &mut bevy::app::App) {
         let exe_dir = std::env::current_exe().unwrap();
         let exe_dir = exe_dir.parent().unwrap();
 
         let mut runtime = Runtime::new();
 
-        assert!(runtime.ping(), "failed to bind and initialize C# Runtime");
-        runtime.scope = Some(runtime.create_scope());
+        assert!(runtime.managed.ping(), "failed to bind and initialize C# Runtime");
+        runtime.scope = Some(runtime.managed.create_scope());
 
         #[cfg(debug_assertions)]
         {
@@ -124,6 +117,7 @@ impl bevy::app::Plugin for CSharpScripting {
             (
                 AssemblyType::Engine,
                 runtime
+                    .managed
                     .load_from_path(
                         runtime.scope.as_ref().unwrap(),
                         exe_dir.join("managed").join("Engine.dll"),
@@ -133,6 +127,7 @@ impl bevy::app::Plugin for CSharpScripting {
             (
                 AssemblyType::Scripts,
                 runtime
+                    .managed
                     .load_from_path(
                         runtime.scope.as_ref().unwrap(),
                         exe_dir.join("managed").join("Scripts.dll"),
@@ -142,22 +137,5 @@ impl bevy::app::Plugin for CSharpScripting {
         ]);
 
         app.insert_resource(runtime);
-        app.add_systems(bevy::prelude::Update, update);
-    }
-}
-
-fn update(
-    runtime: bevy::prelude::Res<Runtime>,
-    delta: bevy::prelude::Res<bevy::prelude::Time>,
-    query: Query<&Instance>,
-) {
-    let dt = delta.delta_secs();
-
-    for instance in &query {
-        if let Some(script) = runtime.get_script(instance) {
-            if let Some(update) = script.borrow_mut().get_method(runtime.as_ref(), "Update", 1) {
-                runtime.invoke(&update, Some(instance.as_ref()), &[(&raw const dt).cast()]);
-            }
-        }
     }
 }

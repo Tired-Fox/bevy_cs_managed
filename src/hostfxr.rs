@@ -119,8 +119,9 @@ impl Hostfxr {
         };
         assert_eq!(
             result, 0,
-            "hostfxr failed to fetch dll function with delegate: 0x{:X}",
-            result
+            "hostfxr failed to fetch dll function with delegate: 0x{:X}\n{}\n{method}",
+            result,
+            r#type,
         );
         delegate
     }

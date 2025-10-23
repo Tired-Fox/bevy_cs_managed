@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::{Path, PathBuf}};
+use std::{collections::BTreeMap, path::{Path, PathBuf}, process::Stdio};
 
 use super::diagnostic::{Diagnostic, Severity};
 
@@ -49,6 +49,7 @@ impl Builder {
             .args(["-c", "Release"])
             .arg("-flp:v=q")
             .arg(format!("-flp:logfile={}", build_log.display()))
+            .stdout(Stdio::inherit())
             .output()
             .unwrap();
 

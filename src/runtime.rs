@@ -1,8 +1,8 @@
 use std::{
-    borrow::Cow, cell::RefCell, collections::{hash_map::Entry, HashMap}, ffi::c_void, path::{Path, PathBuf}, rc::Rc
+    borrow::Cow, cell::RefCell, collections::{hash_map::Entry, HashMap}, ffi::{c_void, CStr}, ops::Deref, path::{Path, PathBuf}, rc::Rc
 };
 
-use bevy::{ecs::resource::Resource};
+use bevy::ecs::resource::Resource;
 
 use crate::{dotnet, hostfxr::Hostfxr};
 
@@ -21,30 +21,6 @@ pub struct Versions {
     pub net: String,
 }
 
-pub type Destroy = unsafe extern "system" fn(*const c_void) -> i32;
-
-pub struct Managed {
-    pub(crate) ping: unsafe extern "system" fn(*mut u32) -> i32,
-    pub(crate) destroy: Destroy,
-
-    pub(crate) create_scope: unsafe extern "system" fn(*const c_void, *mut *const c_void) -> i32,
-    pub(crate) load_from_path:
-        unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void) -> i32,
-    pub(crate) unload_scope: unsafe extern "system" fn(*const c_void) -> i32,
-
-    pub(crate) get_class:
-        unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void) -> i32,
-
-    pub(crate) new: unsafe extern "system" fn(*const c_void, *mut *const c_void) -> i32,
-    pub(crate) is_assignable_from:
-        unsafe extern "system" fn(*const c_void, *const c_void, *mut i32) -> i32,
-    pub(crate) get_method:
-        unsafe extern "system" fn(*const c_void, *const c_void, i32, *mut *const c_void) -> i32,
-
-    pub(crate) runtime_invoke:
-        unsafe extern "system" fn(*const c_void, *const c_void, *const *const c_void) -> i32,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AssemblyType {
     Engine,
@@ -60,46 +36,89 @@ pub struct Runtime {
     pub versions: Versions,
 
     host: Hostfxr,
-    managed: Managed,
+    pub managed: Managed,
 
     pub scope: Option<Scope>,
     pub assemblies: HashMap<AssemblyType, Assembly>,
 
     pub fullname_to_script: HashMap<Cow<'static, str>, usize>,
-    pub scripts: Vec<Rc<RefCell<Script>>>,
+    pub scripts: Vec<Type>,
 }
 
 // TODO: Add Reflect which fetches cached public fields
-pub struct Script {
+pub struct Type {
     pub(crate) name: Cow<'static, str>,
     pub(crate) class: Class,
 
-    pub(crate) methods: HashMap<(String, i32), Rc<Method>>,
+    pub(crate) methods: RefCell<HashMap<(String, i32), Rc<Method>>>,
 }
-impl Script {
-    pub fn get_method(
-        &mut self,
-        runtime: &Runtime,
-        name: impl std::fmt::Display,
-        args: i32,
-    ) -> Option<Rc<Method>> {
-        match self.methods.entry((name.to_string(), args)) {
-            Entry::Occupied(entry) => Some(entry.get().clone()),
-            Entry::Vacant(entry) => {
-                let method = Rc::new(runtime.get_method(&self.class, &entry.key().0, args)?);
-                entry.insert(method.clone());
-                Some(method)
-            }
-        }
+
+pub struct Invokable<'s> {
+    instance: &'s Object,
+    method: Rc<Method>,
+    invoke: Invoke,
+}
+impl<'s> Invokable<'s> {
+    pub fn invoke(&self, args: impl ManagedParams) {
+        let params = args.into_managed_params();
+        unsafe {
+            (self.invoke)(
+                self.method.as_ptr(),
+                self.instance.as_ptr(),
+                params.as_ptr(),
+            )
+        };
+    }
+}
+
+pub trait ManagedParam {
+    fn into_managed_param(self) -> *const c_void;
+}
+impl<A> ManagedParam for &A {
+    fn into_managed_param(self) -> *const c_void {
+        self as *const _ as *const c_void
+    }
+}
+impl ManagedParam for Object {
+    fn into_managed_param(self) -> *const c_void {
+        self.as_ptr()
+    }
+}
+
+pub trait ManagedParams {
+    fn into_managed_params(self) -> Vec<*const c_void>;
+}
+impl ManagedParams for () {
+    fn into_managed_params(self) -> Vec<*const c_void> {
+        Vec::new()
+    }
+}
+impl<A: ManagedParam> ManagedParams for A {
+    fn into_managed_params(self) -> Vec<*const c_void> {
+        Vec::from([self.into_managed_param()])
+    }
+}
+impl<A: ManagedParam, B: ManagedParam> ManagedParams for (A, B) {
+    fn into_managed_params(self) -> Vec<*const c_void> {
+        Vec::from([
+            self.0.into_managed_param(),
+            self.1.into_managed_param(),
+        ])
     }
 }
 
 #[derive(bevy::prelude::Component)]
-pub struct Instance {
+pub struct Script {
     pub(crate) index: usize,
     pub(crate) instance: Object,
 }
-impl AsRef<Object> for Instance {
+impl Deref for Script {
+    type Target = Object;
+    fn deref(&self) -> &Self::Target {
+        &self.instance
+    }
+}
+impl AsRef<Object> for Script {
     fn as_ref(&self) -> &Object {
         &self.instance
     }
@@ -117,7 +136,7 @@ impl Drop for Runtime {
 }
 
 impl Runtime {
-    #[allow(clippy::missing_transmute_annotations, clippy::new_without_default)]
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let exe_parent = std::env::current_exe().unwrap();
         let exe_dir = exe_parent.parent().unwrap();
@@ -166,64 +185,7 @@ impl Runtime {
 
         log::debug!("[bind] Runtime.dll methods");
         Self {
-            managed: unsafe {
-                Managed {
-                    ping: std::mem::transmute(host.get_function_with_delegate(
-                        "Host, Runtime",
-                        "Ping",
-                        "Host+PingDelegate, Runtime",
-                    )),
-                    destroy: std::mem::transmute(host.get_function_with_delegate(
-                        "Host, Runtime",
-                        "Destroy",
-                        "Host+DestroyDelegate, Runtime",
-                    )),
-
-                    create_scope: std::mem::transmute(host.get_function_with_delegate(
-                        "Host, Runtime",
-                        "CreateScope",
-                        "Host+CreateScopeDelegate, Runtime",
-                    )),
-                    unload_scope: std::mem::transmute(host.get_function_with_delegate(
-                        "Host, Runtime",
-                        "Unload",
-                        "Host+UnloadDelegate, Runtime",
-                    )),
-                    load_from_path: std::mem::transmute(host.get_function_with_delegate(
-                        "Host, Runtime",
-                        "LoadFromPath",
-                        "Host+LoadFromPathDelegate, Runtime",
-                    )),
-
-                    get_class: std::mem::transmute(host.get_function_with_delegate(
-                        "Host, Runtime",
-                        "GetClass",
-                        "Host+GetClassDelegate, Runtime",
-                    )),
-
-                    new: std::mem::transmute(host.get_function_with_delegate(
-                        "Host, Runtime",
-                        "New",
-                        "Host+NewDelegate, Runtime",
-                    )),
-                    is_assignable_from: std::mem::transmute(host.get_function_with_delegate(
-                        "Host, Runtime",
-                        "IsAssignableFrom",
-                        "Host+IsAssignableFromDelegate, Runtime",
-                    )),
-                    get_method: std::mem::transmute(host.get_function_with_delegate(
-                        "Host, Runtime",
-                        "GetMethod",
-                        "Host+GetMethodDelegate, Runtime",
-                    )),
-
-                    runtime_invoke: std::mem::transmute(host.get_function_with_delegate(
-                        "Host, Runtime",
-                        "RuntimeInvoke",
-                        "Host+RuntimeInvokeDelegate, Runtime",
-                    )),
-                }
-            },
+            managed: Managed::new(&host),
             host,
             paths,
             versions,
@@ -236,27 +198,68 @@ impl Runtime {
     }
 
     /// Create a new instance of a class associated with a certain script index
-    pub fn create(&mut self, name: impl AsRef<str>) -> Result<Instance, String> {
+    pub fn create(&mut self, name: impl AsRef<str>) -> Result<Script, String> {
         if let Some(index) = self.fullname_to_script.get(name.as_ref()).copied() {
-            let script = self.scripts[index].borrow();
-            let instance = self.new_object(&script.class).ok_or(format!("failed to initialize script class: {}", script.name))?;
-            Ok(Instance { index, instance })
+            let script = &self.scripts[index];
+            let instance = self.managed.new_object(&script.class).ok_or(format!(
+                "failed to initialize script class: {}",
+                script.name
+            ))?;
+            Ok(Script { index, instance })
         } else {
             let scripts_asm = self.assemblies.get(&AssemblyType::Scripts).unwrap();
-            let class = self.get_class(scripts_asm, name.as_ref()).ok_or(format!("unknown class: {}", name.as_ref()))?;
+            let class = self
+                .managed
+                .get_class(scripts_asm, name.as_ref())
+                .ok_or(format!("unknown class: {}", name.as_ref()))?;
+            self.managed.get_meta_data(&class);
             let name: Cow<'static, str> = name.as_ref().to_string().into();
             let index = self.scripts.len();
             self.fullname_to_script.insert(name.clone(), index);
-            self.scripts.push(Rc::new(RefCell::new(Script { name, class, methods: Default::default() })));
+            self.scripts.push(Type {
+                name,
+                class,
+                methods: Default::default(),
+            });
 
-            let script = self.scripts[index].borrow();
-            let instance = self.new_object(&script.class).ok_or(format!("failed to initialize script class: {}", script.name))?;
-            Ok(Instance { index, instance })
+            let script = &self.scripts[index];
+            let instance = self.managed.new_object(&script.class).ok_or(format!(
+                "failed to initialize script class: {}",
+                script.name
+            ))?;
+            Ok(Script { index, instance })
         }
     }
 
-    pub fn get_script(&self, instance: &Instance) -> Option<Rc<RefCell<Script>>> {
-        self.scripts.get(instance.index).cloned()
+    pub fn get_method<'s>(
+        &self,
+        handle: &'s Script,
+        name: impl std::fmt::Display,
+        args: i32,
+    ) -> Option<Invokable<'s>> {
+        if let Some(script) = self.scripts.get(handle.index) {
+            return match script.methods.borrow_mut().entry((name.to_string(), args)) {
+                Entry::Occupied(entry) => Some(Invokable {
+                    instance: &handle.instance,
+                    method: entry.get().clone(),
+                    invoke: self.managed.runtime_invoke,
+                }),
+                Entry::Vacant(entry) => {
+                    let method = Rc::new(self.managed.get_method(
+                        &script.class,
+                        &entry.key().0,
+                        args,
+                    )?);
+                    entry.insert(method.clone());
+                    Some(Invokable {
+                        instance: &handle.instance,
+                        method,
+                        invoke: self.managed.runtime_invoke,
+                    })
+                }
+            };
+        }
+        None
     }
 
     pub fn get_config_path(&self) -> &Path {
@@ -286,18 +289,133 @@ impl Runtime {
     pub fn get_net_version(&self) -> &str {
         &self.versions.net
     }
+}
+
+pub type Destroy = unsafe extern "system" fn(*const c_void) -> i32;
+pub type SetFieldValue = 
+    unsafe extern "system" fn(*const c_void, *const c_void, *const c_void) -> i32;
+pub type Invoke =
+    unsafe extern "system" fn(*const c_void, *const c_void, *const *const c_void) -> i32;
+
+pub struct Managed {
+    pub(crate) ping: unsafe extern "system" fn(*mut u32) -> i32,
+    pub(crate) destroy: Destroy,
+    pub(crate) free: unsafe extern "system" fn(*const c_void) -> i32,
+
+    pub(crate) create_scope: unsafe extern "system" fn(*const c_void, *mut *const c_void) -> i32,
+    pub(crate) load_from_path:
+        unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void) -> i32,
+    pub(crate) unload_scope: unsafe extern "system" fn(*const c_void) -> i32,
+
+    pub(crate) get_class:
+        unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void) -> i32,
+
+    pub(crate) new: unsafe extern "system" fn(*const c_void, *mut *const c_void) -> i32,
+    pub(crate) is_assignable_from:
+        unsafe extern "system" fn(*const c_void, *const c_void, *mut i32) -> i32,
+    pub(crate) get_method:
+        unsafe extern "system" fn(*const c_void, *const c_void, i32, *mut *const c_void) -> i32,
+    pub(crate) get_meta_data:
+        unsafe extern "system" fn(*const c_void, *mut *const c_void) -> i32,
+    pub(crate) set_field_value: SetFieldValue,
+
+    pub(crate) runtime_invoke: Invoke,
+}
+
+impl Managed {
+    #[allow(clippy::missing_transmute_annotations)]
+    pub fn new(host: &Hostfxr) -> Self {
+        unsafe {
+            Managed {
+                ping: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "Ping",
+                    "Host+PingDelegate, Runtime",
+                )),
+                destroy: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "Destroy",
+                    "Host+DestroyDelegate, Runtime",
+                )),
+                free: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "Free",
+                    "Host+FreeDelegate, Runtime",
+                )),
+
+                create_scope: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "CreateScope",
+                    "Host+CreateScopeDelegate, Runtime",
+                )),
+                unload_scope: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "Unload",
+                    "Host+UnloadDelegate, Runtime",
+                )),
+                load_from_path: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "LoadFromPath",
+                    "Host+LoadFromPathDelegate, Runtime",
+                )),
+
+                get_class: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "GetClass",
+                    "Host+GetClassDelegate, Runtime",
+                )),
+
+                new: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "New",
+                    "Host+NewDelegate, Runtime",
+                )),
+                is_assignable_from: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "IsAssignableFrom",
+                    "Host+IsAssignableFromDelegate, Runtime",
+                )),
+                get_method: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "GetMethod",
+                    "Host+GetMethodDelegate, Runtime",
+                )),
+                get_meta_data: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "GetMetaData",
+                    "Host+GetMetaDataDelegate, Runtime",
+                )),
+                set_field_value: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "SetFieldValue",
+                    "Host+SetFieldValueDelegate, Runtime",
+                )),
+
+                runtime_invoke: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "RuntimeInvoke",
+                    "Host+RuntimeInvokeDelegate, Runtime",
+                )),
+            }
+        }
+    }
 
     pub fn ping(&self) -> bool {
         let mut out: u32 = 0;
-        unsafe { (self.managed.ping)(&raw mut out) };
+        unsafe { (self.ping)(&raw mut out) };
         out == 1
+    }
+
+    pub fn free(&self, value: &CStr) {
+        // TODO: Error Handling
+        unsafe { (self.free)(value.as_ptr().cast()) };
     }
 
     pub fn create_scope(&self) -> Scope {
         let mut out: *const c_void = std::ptr::null();
         // TODO: Error handling
-        unsafe { (self.managed.create_scope)(std::ptr::null(), &raw mut out) };
-        Scope::new(out, self.managed.unload_scope)
+        unsafe { (self.create_scope)(std::ptr::null(), &raw mut out) };
+        Scope::new(out, self.unload_scope)
     }
 
     pub fn load_from_path(&self, scope: &Scope, path: impl AsRef<Path>) -> Option<Assembly> {
@@ -308,9 +426,7 @@ impl Runtime {
 
         let mut out: *const c_void = std::ptr::null();
         // TODO: Error handling
-        unsafe {
-            (self.managed.load_from_path)(scope.as_ptr(), path.as_ptr().cast(), &raw mut out)
-        };
+        unsafe { (self.load_from_path)(scope.as_ptr(), path.as_ptr().cast(), &raw mut out) };
 
         if out.is_null() {
             None
@@ -326,31 +442,31 @@ impl Runtime {
         }
         // TODO: Error handling
         let mut out: *const c_void = std::ptr::null();
-        unsafe { (self.managed.get_class)(assembly.as_ptr(), name.as_ptr().cast(), &raw mut out) };
+        unsafe { (self.get_class)(assembly.as_ptr(), name.as_ptr().cast(), &raw mut out) };
 
         if out.is_null() {
             None
         } else {
-            Some(Class::new(out, self.managed.destroy))
+            Some(Class::new(out, self.destroy))
         }
     }
 
     pub fn new_object(&self, class: &Class) -> Option<Object> {
         // TODO: Error handling
         let mut out: *const c_void = std::ptr::null();
-        unsafe { (self.managed.new)(class.as_ptr(), &raw mut out) };
+        unsafe { (self.new)(class.as_ptr(), &raw mut out) };
 
         if out.is_null() {
             None
         } else {
-            Some(Object::new(out, self.managed.destroy))
+            Some(Object::new(out, self.set_field_value, self.destroy))
         }
     }
 
     pub fn is_assignable_from(&self, base: &Class, target: &Class) -> bool {
         // TODO: Error handling
         let mut out: i32 = 0;
-        unsafe { (self.managed.is_assignable_from)(base.as_ptr(), target.as_ptr(), &raw mut out) };
+        unsafe { (self.is_assignable_from)(base.as_ptr(), target.as_ptr(), &raw mut out) };
         out == 1
     }
 
@@ -366,21 +482,47 @@ impl Runtime {
         }
         // TODO: Error handling
         let mut out: *const c_void = std::ptr::null();
-        unsafe {
-            (self.managed.get_method)(class.as_ptr(), name.as_ptr().cast(), args, &raw mut out)
-        };
+        unsafe { (self.get_method)(class.as_ptr(), name.as_ptr().cast(), args, &raw mut out) };
 
         if out.is_null() {
             None
         } else {
-            Some(Method::new(out, self.managed.destroy))
+            Some(Method::new(out, self.destroy))
         }
+    }
+
+    pub fn get_meta_data(
+        &self,
+        class: &Class,
+    ) {
+        // TODO: Error handling
+        let mut out: *const c_void = std::ptr::null();
+        unsafe { (self.get_meta_data)(class.as_ptr(), &raw mut out) };
+
+        if !out.is_null() {
+            let payload = unsafe { CStr::from_ptr(out.cast()) };
+            println!("{}", payload.to_string_lossy());
+            unsafe { (self.free)(out) };
+        }
+    }
+
+    pub fn set_field_value<A>(
+        &self,
+        instance: &Object,
+        name: impl AsRef<str>,
+        value: impl ManagedParam
+    ) {
+        let mut name = name.as_ref().to_string();
+        if !name.ends_with('\0') { name.push('\0'); }
+
+        // TODO: Error handling
+        unsafe { (self.set_field_value)(instance.as_ptr(), name.as_ptr().cast(), value.into_managed_param()) };
     }
 
     pub fn invoke(&self, method: &Method, instance: Option<&Object>, args: &[*const c_void]) {
         // TODO: Error handling
         unsafe {
-            (self.managed.runtime_invoke)(
+            (self.runtime_invoke)(
                 method.as_ptr(),
                 instance
                     .map(|v| v.as_ptr().cast())
@@ -471,13 +613,26 @@ impl Drop for Method {
 
 pub struct Object {
     inner: *const c_void,
+    set_field_value: SetFieldValue,
     destroy: Destroy,
 }
 unsafe impl Send for Object {}
 unsafe impl Sync for Object {}
 impl Object {
-    fn new(inner: *const c_void, destroy: Destroy) -> Self {
-        Self { inner, destroy }
+    fn new(inner: *const c_void, set_field_value: SetFieldValue, destroy: Destroy) -> Self {
+        Self { inner, set_field_value, destroy }
+    }
+
+    pub fn set_field_value(
+        &self,
+        name: impl AsRef<str>,
+        value: impl ManagedParam
+    ) {
+        let mut name = name.as_ref().to_string();
+        if !name.ends_with('\0') { name.push('\0'); }
+
+        // TODO: Error handling
+        unsafe { (self.set_field_value)(self.inner, name.as_ptr().cast(), value.into_managed_param()) };
     }
 }
 impl Wrapper for Object {
