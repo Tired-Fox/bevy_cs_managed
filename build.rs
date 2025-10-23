@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Once};
 
-use log::{Metadata, Record};
+use log::{Level, Metadata, Record};
 
 #[path = "src/config.rs"]
 mod config;
@@ -11,10 +11,12 @@ mod dotnet;
 
 static RUNTIME_CS: &[u8] = include_bytes!("Runtime.cs");
 
+#[allow(dead_code)]
 struct Paths {
     dotnet: PathBuf,
     hostfxr: PathBuf,
     config: PathBuf,
+    project: PathBuf,
     profile: PathBuf,
     target: PathBuf,
     output: PathBuf,
@@ -23,19 +25,21 @@ struct Paths {
 fn main() {
     init_build_logger();
 
+    let cwd = std::env::current_dir().unwrap();
     let output = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not bound"));
+
     let constants = output.join("constants.rs");
     let profile = output.parent().unwrap().parent().unwrap().parent().unwrap();
-    let target = output.parent().unwrap();
 
     let dotnet_path = dotnet::get_path().expect("dotnet not found");
 
     let paths = Paths {
         hostfxr: dotnet_path.join("host").join("fxr"),
         dotnet: dotnet_path,
-        config: std::env::current_dir().unwrap().join("managed.config.json"),
         profile: profile.to_path_buf(),
-        target: target.to_path_buf(),
+        config: cwd.join("managed.config.json"),
+        target: cwd.join("target"),
+        project: cwd,
         output,
     };
 
@@ -164,22 +168,22 @@ fn ensure_runtime(framework: &str, net: &str, paths: &Paths, builder: &dotnet::B
 
         log::debug!(
             "[copy] {} to {}",
-            runtimeconfig_bin.display(),
-            runtime_out_config.display()
+            runtimeconfig_bin.strip_prefix(&paths.project).unwrap().display(),
+            runtime_out_config.strip_prefix(&paths.project).unwrap().display()
         );
         std::fs::copy(&runtimeconfig_bin, &runtime_out_config).unwrap();
         log::debug!(
             "[copy] {} to {}",
-            runtime_dll_bin.display(),
-            runtime_out_dll.display()
+            runtime_dll_bin.strip_prefix(&paths.project).unwrap().display(),
+            runtime_out_dll.strip_prefix(&paths.project).unwrap().display()
         );
         std::fs::copy(&runtime_dll_bin, &runtime_out_dll).unwrap();
     } else {
         if !runtime_out_config.exists() {
             log::debug!(
                 "[copy] {} to {}",
-                runtimeconfig_bin.display(),
-                runtime_out_config.display()
+                runtimeconfig_bin.strip_prefix(&paths.project).unwrap().display(),
+                runtime_out_config.strip_prefix(&paths.project).unwrap().display()
             );
             std::fs::copy(&runtimeconfig_bin, &runtime_out_config).unwrap();
         }
@@ -187,8 +191,8 @@ fn ensure_runtime(framework: &str, net: &str, paths: &Paths, builder: &dotnet::B
         if !runtime_out_dll.exists() {
             log::debug!(
                 "[copy] {} to {}",
-                runtime_dll_bin.display(),
-                runtime_out_dll.display()
+                runtime_dll_bin.strip_prefix(&paths.project).unwrap().display(),
+                runtime_out_dll.strip_prefix(&paths.project).unwrap().display()
             );
             std::fs::copy(&runtime_dll_bin, &runtime_out_dll).unwrap();
         }
@@ -201,12 +205,23 @@ impl log::Log for BuildScriptLogger {
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
-            println!("cargo:warning={}", record.args());
+            let lvl = record.level();
+            println!("cargo:warning={}{: >5}\x1b[0m {}", level_to_color(lvl), lvl, record.args());
         }
     }
 
     fn flush(&self) {
         // No-op for this simple example, but you might flush buffers here
+    }
+}
+
+fn level_to_color(level: Level) -> &'static str {
+    match level {
+        Level::Debug => "\x1b[35m",
+        Level::Warn => "\x1b[33m",
+        Level::Info => "\x1b[34m",
+        Level::Error => "\x1b[31m",
+        _ => "\x1b[39m",
     }
 }
 

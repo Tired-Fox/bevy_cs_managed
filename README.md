@@ -5,6 +5,19 @@ A Bevy plugin that adds a .NET C# Scripting runtime
 > [!WARNING]
 > This project is in early development and is very experimental
 
+Current progress:
+  - Compiling custom runtime, engine api, and scripts
+  - Loading engine api and scripts
+  - Binding runtime api
+  - Loads class from scripts
+  - Executes method on Class instance on component add and on update
+
+> Look at `src/bin/simple.rs`, `assets/engine/Bevy.cs`, and `assets/scripts/Player.cs` for example implementation
+
+Run with `cargo run --bin=simple` and optionally add `--features=always-compile-runtime` to force compile the custom runtime each build
+
+![0.0.0 Progress Update](/readme/0.0.0-progres-update.gif)
+
 ### What it does
 
 1. Finds an appropriate .Net version on the users system
@@ -40,40 +53,33 @@ mobile and web, or making it compatible with [Mono](https://www.mono-project.com
 - [ ] Write a .Net runtime similar to `Mono` to allow for the following:
     - [x] scoping
     - [x] loading dll
-    - [ ] searching and validating types
-    - [ ] fetching and calling methods
+    - [x] searching and validating types
+    - [x] fetching and calling methods
     - [ ] Error return values
     - [ ] Optimal memory management.
         - Is `GCHandle.Alloc` with `GCHandle.Free` on `Drop` good enough?
         - Is it better to find a way to make the data returned raw pointers which can be pinned with the runtime api similar to Mono?
 - [x] Compiled runtime dll
-    - [ ] Compiled once for the given .Net version
-- [x] Child process for cached and continuous dotnet builds
-    - [ ] Compiled once for the given .Net version
-    - First compile job is the slowest as it loads all the dependencies
-    - Subsequent builds are much faster than `dotnet build`
-    - Isolated from system environements like `dotnet build-server`
-    - Output build diagnostics as json for easy formatting
-    - Accurate elapsed build times
-- [ ] Bind runtime
+    - [x] Compiled once for the given .Net version
+- [x] Bind runtime
 - [ ] Bind interop functions
 - [ ] Bind interop data
 - [ ] Generate Engine API bindings
 - [ ] Compile Engine API
     - [x] Compile dll to `target` directory
     - [ ] Gracefully handle errors
-- [ ] Load Engine API
+- [x] Load Engine API
 - [ ] Compile user scripts
     - [x] Compile dll to `target` directory
     - [ ] Gracefully handle errors
-- [ ] Load user Scripts
-- [ ] Bind user script methods to hooks
+- [x] Load user Scripts
+- [x] Bind user script methods to hooks
 - [ ] Hot reload and compile user scripts on file changes
 - [ ] Build script for distrobution (production) builds
     - [ ] Lock behind feature flag
     - [ ] Bundle the users selected .Net
     - [ ] Compiled and bundle
-        - [ ] Runtime dll and runtimeconfig
+        - [x] Runtime dll and runtimeconfig
         - [ ] Engine.dll
         - [ ] Scripts.dll
 - [ ] Optionally use [Mono]() for all platforms or mobile and web

@@ -1,9 +1,7 @@
 # Files generated from scripting plugin
-**/bin
-**/obj
-**/.bin
-**/.obj
-**/*.csproj
-**/build.log
+assets/**/obj
+assets/**/bin
+assets/**/*.csproj
+assets/**/build.log
 
 /target
