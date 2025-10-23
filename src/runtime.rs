@@ -1,8 +1,16 @@
 use std::{
-    borrow::Cow, cell::RefCell, collections::{hash_map::Entry, HashMap}, ffi::{c_void, CStr}, ops::Deref, path::{Path, PathBuf}, rc::Rc
+    borrow::Cow,
+    cell::RefCell,
+    collections::{hash_map::Entry, HashMap},
+    ffi::{c_void, CStr},
+    ops::Deref,
+    path::{Path, PathBuf},
+    rc::Rc
 };
 
 use bevy::ecs::resource::Resource;
+use serde::{de::DeserializeOwned, Deserialize};
+use serde_json::Value;
 
 use crate::{dotnet, hostfxr::Hostfxr};
 
@@ -36,13 +44,13 @@ pub struct Runtime {
     pub versions: Versions,
 
     host: Hostfxr,
-    pub managed: Managed,
+    pub library: RuntimeLibrary,
 
     pub scope: Option<Scope>,
     pub assemblies: HashMap<AssemblyType, Assembly>,
 
     pub fullname_to_script: HashMap<Cow<'static, str>, usize>,
-    pub scripts: Vec<Type>,
+    pub scripts: Vec<Rc<Type>>,
 }
 
 // TODO: Add Reflect which fetches cached public fields
@@ -51,6 +59,7 @@ pub struct Type {
     pub(crate) class: Class,
 
     pub(crate) methods: RefCell<HashMap<(String, i32), Rc<Method>>>,
+    pub(crate) metadata: MetaData,
 }
 
 pub struct Invokable<'s> {
@@ -100,10 +109,7 @@ impl<A: ManagedParam> ManagedParams for A {
 }
 impl<A: ManagedParam, B: ManagedParam> ManagedParams for (A, B) {
     fn into_managed_params(self) -> Vec<*const c_void> {
-        Vec::from([
-            self.0.into_managed_param(),
-            self.1.into_managed_param(),
-        ])
+        Vec::from([self.0.into_managed_param(), self.1.into_managed_param()])
     }
 }
 
@@ -185,7 +191,7 @@ impl Runtime {
 
         log::debug!("[bind] Runtime.dll methods");
         Self {
-            managed: Managed::new(&host),
+            library: RuntimeLibrary::new(&host),
             host,
             paths,
             versions,
@@ -201,7 +207,7 @@ impl Runtime {
     pub fn create(&mut self, name: impl AsRef<str>) -> Result<Script, String> {
         if let Some(index) = self.fullname_to_script.get(name.as_ref()).copied() {
             let script = &self.scripts[index];
-            let instance = self.managed.new_object(&script.class).ok_or(format!(
+            let instance = self.library.new_object(&script.class).ok_or(format!(
                 "failed to initialize script class: {}",
                 script.name
             ))?;
@@ -209,21 +215,22 @@ impl Runtime {
         } else {
             let scripts_asm = self.assemblies.get(&AssemblyType::Scripts).unwrap();
             let class = self
-                .managed
+                .library
                 .get_class(scripts_asm, name.as_ref())
                 .ok_or(format!("unknown class: {}", name.as_ref()))?;
-            self.managed.get_meta_data(&class);
+            let metadata = self.library.get_meta_data(&class).map_err(|v| v.to_string())?;
             let name: Cow<'static, str> = name.as_ref().to_string().into();
             let index = self.scripts.len();
             self.fullname_to_script.insert(name.clone(), index);
-            self.scripts.push(Type {
+            self.scripts.push(Rc::new(Type {
                 name,
                 class,
                 methods: Default::default(),
-            });
+                metadata,
+            }));
 
             let script = &self.scripts[index];
-            let instance = self.managed.new_object(&script.class).ok_or(format!(
+            let instance = self.library.new_object(&script.class).ok_or(format!(
                 "failed to initialize script class: {}",
                 script.name
             ))?;
@@ -242,10 +249,10 @@ impl Runtime {
                 Entry::Occupied(entry) => Some(Invokable {
                     instance: &handle.instance,
                     method: entry.get().clone(),
-                    invoke: self.managed.runtime_invoke,
+                    invoke: self.library.runtime_invoke,
                 }),
                 Entry::Vacant(entry) => {
-                    let method = Rc::new(self.managed.get_method(
+                    let method = Rc::new(self.library.get_method(
                         &script.class,
                         &entry.key().0,
                         args,
@@ -254,12 +261,17 @@ impl Runtime {
                     Some(Invokable {
                         instance: &handle.instance,
                         method,
-                        invoke: self.managed.runtime_invoke,
+                        invoke: self.library.runtime_invoke,
                     })
                 }
             };
         }
         None
+    }
+
+    pub fn get_meta_data(&mut self, handle: &Script) -> &MetaData {
+        let script = self.scripts.get(handle.index).unwrap();
+        &script.metadata
     }
 
     pub fn get_config_path(&self) -> &Path {
@@ -292,12 +304,14 @@ impl Runtime {
 }
 
 pub type Destroy = unsafe extern "system" fn(*const c_void) -> i32;
-pub type SetFieldValue = 
+pub type SetFieldValue =
     unsafe extern "system" fn(*const c_void, *const c_void, *const c_void) -> i32;
+pub type GetFieldValue =
+    unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void) -> i32;
 pub type Invoke =
     unsafe extern "system" fn(*const c_void, *const c_void, *const *const c_void) -> i32;
 
-pub struct Managed {
+pub struct RuntimeLibrary {
     pub(crate) ping: unsafe extern "system" fn(*mut u32) -> i32,
     pub(crate) destroy: Destroy,
     pub(crate) free: unsafe extern "system" fn(*const c_void) -> i32,
@@ -315,18 +329,20 @@ pub struct Managed {
         unsafe extern "system" fn(*const c_void, *const c_void, *mut i32) -> i32,
     pub(crate) get_method:
         unsafe extern "system" fn(*const c_void, *const c_void, i32, *mut *const c_void) -> i32,
-    pub(crate) get_meta_data:
-        unsafe extern "system" fn(*const c_void, *mut *const c_void) -> i32,
+    pub(crate) get_meta_data: unsafe extern "system" fn(*const c_void, *mut *const c_void) -> i32,
     pub(crate) set_field_value: SetFieldValue,
+    pub(crate) get_field_value: GetFieldValue,
+    pub(crate) set_property_value: SetFieldValue,
+    pub(crate) get_property_value: GetFieldValue,
 
     pub(crate) runtime_invoke: Invoke,
 }
 
-impl Managed {
+impl RuntimeLibrary {
     #[allow(clippy::missing_transmute_annotations)]
     pub fn new(host: &Hostfxr) -> Self {
         unsafe {
-            Managed {
+            RuntimeLibrary {
                 ping: std::mem::transmute(host.get_function_with_delegate(
                     "Host, Runtime",
                     "Ping",
@@ -389,6 +405,21 @@ impl Managed {
                     "Host, Runtime",
                     "SetFieldValue",
                     "Host+SetFieldValueDelegate, Runtime",
+                )),
+                get_field_value: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "GetFieldValue",
+                    "Host+GetFieldValueDelegate, Runtime",
+                )),
+                set_property_value: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "SetPropertyValue",
+                    "Host+SetPropertyValueDelegate, Runtime",
+                )),
+                get_property_value: std::mem::transmute(host.get_function_with_delegate(
+                    "Host, Runtime",
+                    "GetPropertyValue",
+                    "Host+GetPropertyValueDelegate, Runtime",
                 )),
 
                 runtime_invoke: std::mem::transmute(host.get_function_with_delegate(
@@ -459,7 +490,15 @@ impl Managed {
         if out.is_null() {
             None
         } else {
-            Some(Object::new(out, self.set_field_value, self.destroy))
+            Some(Object {
+                inner: out,
+                get_field_value: self.get_field_value,
+                set_field_value: self.set_field_value,
+                get_property_value: self.get_property_value,
+                set_property_value: self.set_property_value,
+                destroy: self.destroy,
+                free: self.free,
+            })
         }
     }
 
@@ -491,32 +530,42 @@ impl Managed {
         }
     }
 
-    pub fn get_meta_data(
-        &self,
-        class: &Class,
-    ) {
+    pub fn get_meta_data(&self, class: &Class) -> serde_json::Result<MetaData> {
         // TODO: Error handling
         let mut out: *const c_void = std::ptr::null();
         unsafe { (self.get_meta_data)(class.as_ptr(), &raw mut out) };
 
         if !out.is_null() {
             let payload = unsafe { CStr::from_ptr(out.cast()) };
-            println!("{}", payload.to_string_lossy());
+            let pref = payload.to_string_lossy();
+            let value = serde_json::from_str(&pref);
             unsafe { (self.free)(out) };
+
+            return value;
         }
+
+        Ok(Default::default())
     }
 
-    pub fn set_field_value<A>(
+    pub fn set_field_value(
         &self,
         instance: &Object,
         name: impl AsRef<str>,
-        value: impl ManagedParam
+        value: impl ManagedParam,
     ) {
         let mut name = name.as_ref().to_string();
-        if !name.ends_with('\0') { name.push('\0'); }
+        if !name.ends_with('\0') {
+            name.push('\0');
+        }
 
         // TODO: Error handling
-        unsafe { (self.set_field_value)(instance.as_ptr(), name.as_ptr().cast(), value.into_managed_param()) };
+        unsafe {
+            (self.set_field_value)(
+                instance.as_ptr(),
+                name.as_ptr().cast(),
+                value.into_managed_param(),
+            )
+        };
     }
 
     pub fn invoke(&self, method: &Method, instance: Option<&Object>, args: &[*const c_void]) {
@@ -613,26 +662,84 @@ impl Drop for Method {
 
 pub struct Object {
     inner: *const c_void,
+    get_field_value: GetFieldValue,
     set_field_value: SetFieldValue,
+    get_property_value: GetFieldValue,
+    set_property_value: SetFieldValue,
     destroy: Destroy,
+    free: Destroy,
 }
 unsafe impl Send for Object {}
 unsafe impl Sync for Object {}
 impl Object {
-    fn new(inner: *const c_void, set_field_value: SetFieldValue, destroy: Destroy) -> Self {
-        Self { inner, set_field_value, destroy }
-    }
-
-    pub fn set_field_value(
-        &self,
-        name: impl AsRef<str>,
-        value: impl ManagedParam
-    ) {
+    pub fn set_field_value(&self, name: impl AsRef<str>, value: impl ManagedParam) {
         let mut name = name.as_ref().to_string();
-        if !name.ends_with('\0') { name.push('\0'); }
+        if !name.ends_with('\0') {
+            name.push('\0');
+        }
 
         // TODO: Error handling
-        unsafe { (self.set_field_value)(self.inner, name.as_ptr().cast(), value.into_managed_param()) };
+        unsafe {
+            (self.set_field_value)(self.inner, name.as_ptr().cast(), value.into_managed_param())
+        };
+    }
+
+    pub fn get_field_value<A: DeserializeOwned>(&self, name: impl AsRef<str>) -> Option<A> {
+        let mut name = name.as_ref().to_string();
+        if !name.ends_with('\0') {
+            name.push('\0');
+        }
+
+        // TODO: Error handling
+        let mut out: *const c_void = std::ptr::null();
+        unsafe { (self.get_field_value)(self.inner, name.as_ptr().cast(), &raw mut out) };
+
+        if out.is_null() {
+            return None;
+        }
+
+        let payload = unsafe { CStr::from_ptr(out.cast()) };
+        let payload_ref = payload.to_string_lossy();
+        let value = serde_json::from_str(&payload_ref).ok();
+
+        unsafe { (self.free)(out) };
+
+        value
+    }
+
+    pub fn set_property_value(&self, name: impl AsRef<str>, value: impl ManagedParam) {
+        let mut name = name.as_ref().to_string();
+        if !name.ends_with('\0') {
+            name.push('\0');
+        }
+
+        // TODO: Error handling
+        unsafe {
+            (self.set_property_value)(self.inner, name.as_ptr().cast(), value.into_managed_param())
+        };
+    }
+
+    pub fn get_property_value<A: DeserializeOwned>(&self, name: impl AsRef<str>) -> Option<A> {
+        let mut name = name.as_ref().to_string();
+        if !name.ends_with('\0') {
+            name.push('\0');
+        }
+
+        // TODO: Error handling
+        let mut out: *const c_void = std::ptr::null();
+        unsafe { (self.get_property_value)(self.inner, name.as_ptr().cast(), &raw mut out) };
+
+        if out.is_null() {
+            return None;
+        }
+
+        let payload = unsafe { CStr::from_ptr(out.cast()) };
+        let payload_ref = payload.to_string_lossy();
+        let value = serde_json::from_str(&payload_ref).ok();
+
+        unsafe { (self.free)(out) };
+
+        value
     }
 }
 impl Wrapper for Object {
@@ -644,4 +751,29 @@ impl Drop for Object {
     fn drop(&mut self) {
         unsafe { (self.destroy)(self.inner) };
     }
+}
+
+#[derive(Default, Debug, Clone, Deserialize)]
+#[serde(rename_all="PascalCase")]
+pub struct MetaData {
+    pub fields: Vec<Field>,
+    pub properties: Vec<Property>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all="PascalCase")]
+pub struct Field {
+    pub name: String,
+    pub is_static: bool,
+    pub custom_attributes: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all="PascalCase")]
+pub struct Property {
+    pub name: String,
+    pub is_static: bool,
+    pub custom_attributes: Vec<Value>,
+    pub can_read: bool,
+    pub can_write: bool,
 }

@@ -63,8 +63,8 @@ impl bevy::app::Plugin for CSharpPlugin {
 
         let mut runtime = Runtime::new();
 
-        assert!(runtime.managed.ping(), "failed to bind and initialize C# Runtime");
-        runtime.scope = Some(runtime.managed.create_scope());
+        assert!(runtime.library.ping(), "failed to bind and initialize C# Runtime");
+        runtime.scope = Some(runtime.library.create_scope());
 
         #[cfg(debug_assertions)]
         {
@@ -117,7 +117,7 @@ impl bevy::app::Plugin for CSharpPlugin {
             (
                 AssemblyType::Engine,
                 runtime
-                    .managed
+                    .library
                     .load_from_path(
                         runtime.scope.as_ref().unwrap(),
                         exe_dir.join("managed").join("Engine.dll"),
@@ -127,7 +127,7 @@ impl bevy::app::Plugin for CSharpPlugin {
             (
                 AssemblyType::Scripts,
                 runtime
-                    .managed
+                    .library
                     .load_from_path(
                         runtime.scope.as_ref().unwrap(),
                         exe_dir.join("managed").join("Scripts.dll"),

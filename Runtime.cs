@@ -237,13 +237,103 @@ public class Host
         var fieldName = ReadUtf8Z(name);
         var flags = BindingFlags.Instance | BindingFlags.Public;
 
-        var fi = target.GetType().GetField(fieldName, flags) ?? throw new ArgumentNullException();
-        if (fi.IsStatic || (fi.Attributes & FieldAttributes.InitOnly) != 0) {
-            throw new ArgumentException("FieldNotFound");
+        var fi = target.GetType().GetField(fieldName, flags) ?? throw new Exception("Field not found");
+        if ((fi.Attributes & FieldAttributes.InitOnly) != 0) {
+            throw new Exception("Field not found");
         }
 
         var fv = ReadValueAsObject(value, fi.FieldType);
-        fi.SetValue(target, fv);
+        if (fi.IsStatic) {
+            fi.SetValue(null, fv);
+        } else {
+            fi.SetValue(target, fv);
+        }
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public unsafe delegate void GetFieldValueDelegate(IntPtr instance, IntPtr name, out IntPtr result);
+    public unsafe static void GetFieldValue(IntPtr instance, IntPtr name, out IntPtr result)
+    {
+        var target = Ref<object>(instance) ?? throw new ArgumentNullException();
+        var fieldName = ReadUtf8Z(name);
+        var flags = BindingFlags.Instance | BindingFlags.Public;
+
+        var fi = target.GetType().GetField(fieldName, flags) ?? throw new Exception("Property not found");
+        var value = fi.GetValue(target);
+
+        var options = new JsonSerializerOptions { IncludeFields = true };
+        string response = JsonSerializer.Serialize(value, options);
+
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(response);
+
+        result = Marshal.AllocHGlobal(bytes.Length + 1);
+        Marshal.Copy(bytes, 0, result, bytes.Length);
+        Marshal.WriteByte(result, bytes.Length, 0);
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public unsafe delegate void SetFieldValueUncheckedDelegate(IntPtr instance, IntPtr name, void* value);
+    public unsafe static void SetFieldValueUnchecked(IntPtr instance, IntPtr name, void* value)
+    {
+        var target = Ref<object>(instance) ?? throw new ArgumentNullException();
+        var fieldName = ReadUtf8Z(name);
+        var flags = BindingFlags.Instance | BindingFlags.Public;
+
+        var fi = target.GetType().GetField(fieldName, flags) ?? throw new Exception("Field not found");
+
+        var fv = ReadValueAsObject(value, fi.FieldType);
+        if (fi.IsStatic) {
+            fi.SetValue(null, fv);
+        } else {
+            fi.SetValue(target, fv);
+        }
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public unsafe delegate void SetPropertyValueDelegate(IntPtr instance, IntPtr name, void* value);
+    public unsafe static void SetPropertyValue(IntPtr instance, IntPtr name, void* value)
+    {
+        var target = Ref<object>(instance) ?? throw new ArgumentNullException();
+        var propertyName = ReadUtf8Z(name);
+        var flags = BindingFlags.Instance | BindingFlags.Public;
+
+        var fi = target.GetType().GetProperty(propertyName, flags) ?? throw new Exception("Property not found");
+        if (!fi.CanWrite)
+            throw new ArgumentException("Property doesn't have a setter");
+
+        bool isStatic = (fi.GetGetMethod(true)?.IsStatic ?? false) ||
+            (fi.GetSetMethod(true)?.IsStatic ?? false);
+
+        var fv = ReadValueAsObject(value, fi.PropertyType);
+        if (isStatic) {
+            fi.SetValue(null, fv);
+        } else {
+            fi.SetValue(target, fv);
+        }
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public unsafe delegate void GetPropertyValueDelegate(IntPtr instance, IntPtr name, out IntPtr result);
+    public unsafe static void GetPropertyValue(IntPtr instance, IntPtr name, out IntPtr result)
+    {
+        var target = Ref<object>(instance) ?? throw new ArgumentNullException();
+        var fieldName = ReadUtf8Z(name);
+        var flags = BindingFlags.Instance | BindingFlags.Public;
+
+        var fi = target.GetType().GetProperty(fieldName, flags) ?? throw new Exception("Property not found");
+        if (!fi.CanRead)
+            throw new ArgumentException("Property doesn't have a setter");
+
+        var value = fi.GetValue(target);
+
+        var options = new JsonSerializerOptions { IncludeFields = true };
+        string response = JsonSerializer.Serialize(value, options);
+
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(response);
+
+        result = Marshal.AllocHGlobal(bytes.Length + 1);
+        Marshal.Copy(bytes, 0, result, bytes.Length);
+        Marshal.WriteByte(result, bytes.Length, 0);
     }
 
     // ----- METHOD -----

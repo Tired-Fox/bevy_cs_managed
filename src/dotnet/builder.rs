@@ -49,14 +49,14 @@ impl Builder {
             .args(["-c", "Release"])
             .arg("-flp:v=q")
             .arg(format!("-flp:logfile={}", build_log.display()))
-            .stdout(Stdio::inherit())
+            .stdout(Stdio::piped())
             .output()
             .unwrap();
 
         log::debug!("[compile] {name} {:.3} s", now.elapsed().as_secs_f64());
 
         if !result.status.success() {
-            panic!("dotnet failed to build '{name}'");
+            panic!("[build] failure: {}",  String::from_utf8_lossy(&result.stdout));
         }
 
         if build_log.exists() {
