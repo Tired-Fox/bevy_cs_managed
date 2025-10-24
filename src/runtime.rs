@@ -12,11 +12,12 @@ use bevy::ecs::resource::Resource;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 
-use crate::{dotnet, hostfxr::Hostfxr};
+use crate::{dotnet, hostfxr::Hostfxr, Error, Result};
 
 include!(concat!(std::env!("OUT_DIR"), "/constants.rs"));
 
 pub struct Paths {
+    pub exe: PathBuf,
     pub config: PathBuf,
     pub dll: PathBuf,
     pub dotnet: PathBuf,
@@ -34,23 +35,18 @@ pub enum AssemblyType {
     Engine,
     Scripts,
 }
-
-/// # Saftey
-/// Not safe when used outside of bevy's ecs like in an alternate thread not managed by bevy
-#[allow(dead_code)]
-#[derive(Resource)]
-pub struct Runtime {
-    pub paths: Paths,
-    pub versions: Versions,
-
-    host: Hostfxr,
-    pub library: RuntimeLibrary,
-
-    pub scope: Option<Scope>,
-    pub assemblies: HashMap<AssemblyType, Assembly>,
-
-    pub fullname_to_script: HashMap<Cow<'static, str>, usize>,
-    pub scripts: Vec<Rc<Type>>,
+impl std::fmt::Display for AssemblyType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Engine => write!(f, "Engine"),
+            Self::Scripts => write!(f, "Scripts"),
+        }
+    }
+}
+impl AssemblyType {
+    pub fn path(&self, base: impl AsRef<Path>) -> PathBuf {
+        base.as_ref().join("managed").join(format!("{self}.dll"))
+    }
 }
 
 // TODO: Add Reflect which fetches cached public fields
@@ -68,15 +64,19 @@ pub struct Invokable<'s> {
     invoke: Invoke,
 }
 impl<'s> Invokable<'s> {
-    pub fn invoke(&self, args: impl ManagedParams) {
+    pub fn invoke(&self, args: impl ManagedParams) -> Result<()> {
         let params = args.into_managed_params();
+        let mut err: i32 = -1;
         unsafe {
             (self.invoke)(
                 self.method.as_ptr(),
                 self.instance.as_ptr(),
                 params.as_ptr(),
+                &raw mut err,
             )
         };
+        if err > 0 { return Err(Error::from(err)); }
+        Ok(())
     }
 }
 
@@ -130,6 +130,24 @@ impl AsRef<Object> for Script {
     }
 }
 
+/// # Saftey
+/// Not safe when used outside of bevy's ecs like in an alternate thread not managed by bevy
+#[allow(dead_code)]
+#[derive(Resource)]
+pub struct Runtime {
+    pub paths: Paths,
+    pub versions: Versions,
+
+    host: Hostfxr,
+    pub library: RuntimeLibrary,
+
+    pub scope: Option<Scope>,
+    pub assemblies: HashMap<AssemblyType, Assembly>,
+
+    pub fullname_to_script: HashMap<Cow<'static, str>, usize>,
+    pub scripts: Vec<Rc<Type>>,
+}
+
 // Bevy garuntees that one system at a time is using the resource.
 unsafe impl Send for Runtime {}
 unsafe impl Sync for Runtime {}
@@ -143,11 +161,11 @@ impl Drop for Runtime {
 
 impl Runtime {
     #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         let exe_parent = std::env::current_exe().unwrap();
         let exe_dir = exe_parent.parent().unwrap();
 
-        let dotnet = dotnet::get_path().expect("dotnet not found");
+        let dotnet = dotnet::get_path().ok_or(Error::PathNotFound)?;
         let hostfxr_path = dotnet.join("host").join("fxr");
 
         let versions = Versions {
@@ -160,6 +178,7 @@ impl Runtime {
         log::debug!("    framework: {}", versions.framework);
 
         let paths = Paths {
+            exe: exe_dir.to_path_buf(),
             dotnet,
             config: exe_dir.join("Runtime.runtimeconfig.json"),
             dll: exe_dir.join("Runtime.dll"),
@@ -190,7 +209,7 @@ impl Runtime {
         let host = Hostfxr::new(&paths);
 
         log::debug!("[bind] Runtime.dll methods");
-        Self {
+        Ok(Self {
             library: RuntimeLibrary::new(&host),
             host,
             paths,
@@ -200,42 +219,64 @@ impl Runtime {
             fullname_to_script: Default::default(),
             assemblies: Default::default(),
             scripts: Default::default(),
-        }
+        })
     }
 
     /// Create a new instance of a class associated with a certain script index
-    pub fn create(&mut self, name: impl AsRef<str>) -> Result<Script, String> {
+    pub fn create(&self, name: impl AsRef<str>) -> Result<Script> {
         if let Some(index) = self.fullname_to_script.get(name.as_ref()).copied() {
             let script = &self.scripts[index];
-            let instance = self.library.new_object(&script.class).ok_or(format!(
-                "failed to initialize script class: {}",
-                script.name
-            ))?;
+            let instance = self.library.new_object(&script.class)?.ok_or(Error::UnknownManaged)?;
             Ok(Script { index, instance })
         } else {
-            let scripts_asm = self.assemblies.get(&AssemblyType::Scripts).unwrap();
-            let class = self
-                .library
-                .get_class(scripts_asm, name.as_ref())
-                .ok_or(format!("unknown class: {}", name.as_ref()))?;
-            let metadata = self.library.get_meta_data(&class).map_err(|v| v.to_string())?;
-            let name: Cow<'static, str> = name.as_ref().to_string().into();
-            let index = self.scripts.len();
-            self.fullname_to_script.insert(name.clone(), index);
-            self.scripts.push(Rc::new(Type {
-                name,
-                class,
-                methods: Default::default(),
-                metadata,
-            }));
-
-            let script = &self.scripts[index];
-            let instance = self.library.new_object(&script.class).ok_or(format!(
-                "failed to initialize script class: {}",
-                script.name
-            ))?;
-            Ok(Script { index, instance })
+            Err(Error::ClassNotRegistered)
         }
+    }
+
+    pub fn register(&mut self, name: impl AsRef<str>) -> Result<()> {
+        let scripts_asm = self.assemblies.get(&AssemblyType::Scripts).ok_or(Error::AssemblyNotLoaded)?;
+
+        let class = self
+            .library
+            .get_class(scripts_asm, name.as_ref())?
+            .ok_or(Error::ClassNotFound)?;
+
+        let metadata = self.library.get_meta_data(&class)?;
+        let name: Cow<'static, str> = name.as_ref().to_string().into();
+        let index = self.scripts.len();
+
+        self.fullname_to_script.insert(name.clone(), index);
+        self.scripts.push(Rc::new(Type {
+            name,
+            class,
+            methods: Default::default(),
+            metadata,
+        }));
+
+        Ok(())
+    }
+
+    pub fn load(&mut self, assembly: AssemblyType) -> Result<()> {
+        // TODO: Make the load more dynamic to include more assemblies
+        if let Some(scope) = self.scope.as_ref() {
+            let asm = self.library.load_from_path(scope, assembly.path(&self.paths.exe))?.ok_or(Error::PathNotFound)?;
+            self.assemblies.insert(assembly, asm);
+        }
+        Ok(())
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        self.scripts.truncate(0);
+        self.fullname_to_script = HashMap::new();
+        self.assemblies.clear();
+
+        if let Some(scope) = self.scope.replace(self.library.create_scope()) {
+            let mut err: i32 = -1;
+            unsafe { (self.library.unload_scope)(scope.as_ptr(), &raw mut err) };
+            if err > 0 { return Err(Error::from(err)); }
+        }
+
+        Ok(())
     }
 
     pub fn get_method<'s>(
@@ -243,30 +284,33 @@ impl Runtime {
         handle: &'s Script,
         name: impl std::fmt::Display,
         args: i32,
-    ) -> Option<Invokable<'s>> {
+    ) -> Result<Option<Invokable<'s>>> {
         if let Some(script) = self.scripts.get(handle.index) {
             return match script.methods.borrow_mut().entry((name.to_string(), args)) {
-                Entry::Occupied(entry) => Some(Invokable {
+                Entry::Occupied(entry) => Ok(Some(Invokable {
                     instance: &handle.instance,
                     method: entry.get().clone(),
                     invoke: self.library.runtime_invoke,
-                }),
+                })),
                 Entry::Vacant(entry) => {
-                    let method = Rc::new(self.library.get_method(
+                    let method = Rc::new(match self.library.get_method(
                         &script.class,
                         &entry.key().0,
                         args,
-                    )?);
+                    )? {
+                        Some(m) => m,
+                        None => return Ok(None)
+                    });
                     entry.insert(method.clone());
-                    Some(Invokable {
+                    Ok(Some(Invokable {
                         instance: &handle.instance,
                         method,
                         invoke: self.library.runtime_invoke,
-                    })
+                    }))
                 }
             };
         }
-        None
+        Ok(None)
     }
 
     pub fn get_meta_data(&mut self, handle: &Script) -> &MetaData {
@@ -304,12 +348,13 @@ impl Runtime {
 }
 
 pub type Destroy = unsafe extern "system" fn(*const c_void) -> i32;
+pub type Unload = unsafe extern "system" fn(*const c_void, *mut i32) -> i32;
 pub type SetFieldValue =
-    unsafe extern "system" fn(*const c_void, *const c_void, *const c_void) -> i32;
+    unsafe extern "system" fn(*const c_void, *const c_void, *const c_void, *mut i32) -> i32;
 pub type GetFieldValue =
-    unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void) -> i32;
+    unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void, *mut i32) -> i32;
 pub type Invoke =
-    unsafe extern "system" fn(*const c_void, *const c_void, *const *const c_void) -> i32;
+    unsafe extern "system" fn(*const c_void, *const c_void, *const *const c_void, *mut i32) -> i32;
 
 pub struct RuntimeLibrary {
     pub(crate) ping: unsafe extern "system" fn(*mut u32) -> i32,
@@ -318,18 +363,18 @@ pub struct RuntimeLibrary {
 
     pub(crate) create_scope: unsafe extern "system" fn(*const c_void, *mut *const c_void) -> i32,
     pub(crate) load_from_path:
-        unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void) -> i32,
-    pub(crate) unload_scope: unsafe extern "system" fn(*const c_void) -> i32,
+        unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void, *mut i32) -> i32,
+    pub(crate) unload_scope: Unload,
 
     pub(crate) get_class:
-        unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void) -> i32,
+        unsafe extern "system" fn(*const c_void, *const c_void, *mut *const c_void, *mut i32) -> i32,
 
-    pub(crate) new: unsafe extern "system" fn(*const c_void, *mut *const c_void) -> i32,
+    pub(crate) new: unsafe extern "system" fn(*const c_void, *mut *const c_void, *mut i32) -> i32,
     pub(crate) is_assignable_from:
-        unsafe extern "system" fn(*const c_void, *const c_void, *mut i32) -> i32,
+        unsafe extern "system" fn(*const c_void, *const c_void, *mut i32, *mut i32) -> i32,
     pub(crate) get_method:
-        unsafe extern "system" fn(*const c_void, *const c_void, i32, *mut *const c_void) -> i32,
-    pub(crate) get_meta_data: unsafe extern "system" fn(*const c_void, *mut *const c_void) -> i32,
+        unsafe extern "system" fn(*const c_void, *const c_void, i32, *mut *const c_void, *mut i32) -> i32,
+    pub(crate) get_meta_data: unsafe extern "system" fn(*const c_void, *mut *const c_void, *mut i32) -> i32,
     pub(crate) set_field_value: SetFieldValue,
     pub(crate) get_field_value: GetFieldValue,
     pub(crate) set_property_value: SetFieldValue,
@@ -438,56 +483,59 @@ impl RuntimeLibrary {
     }
 
     pub fn free(&self, value: &CStr) {
-        // TODO: Error Handling
         unsafe { (self.free)(value.as_ptr().cast()) };
     }
 
     pub fn create_scope(&self) -> Scope {
-        let mut out: *const c_void = std::ptr::null();
-        // TODO: Error handling
-        unsafe { (self.create_scope)(std::ptr::null(), &raw mut out) };
-        Scope::new(out, self.unload_scope)
+        unsafe {
+            let mut out: *const c_void = std::ptr::null();
+            (self.create_scope)(std::ptr::null(), &raw mut out);
+            Scope::new(out, self.unload_scope)
+        }
     }
 
-    pub fn load_from_path(&self, scope: &Scope, path: impl AsRef<Path>) -> Option<Assembly> {
+    pub fn load_from_path(&self, scope: &Scope, path: impl AsRef<Path>) -> Result<Option<Assembly>> {
         let mut path = path.as_ref().display().to_string();
         if !path.ends_with('\0') {
             path.push('\0');
         }
 
         let mut out: *const c_void = std::ptr::null();
-        // TODO: Error handling
-        unsafe { (self.load_from_path)(scope.as_ptr(), path.as_ptr().cast(), &raw mut out) };
+        let mut err: i32 = -1;
+        unsafe { (self.load_from_path)(scope.as_ptr(), path.as_ptr().cast(), &raw mut out, &raw mut err) };
+        if err > 0 { return Err(Error::from(err)); }
 
-        if out.is_null() {
+        Ok(if out.is_null() {
             None
         } else {
             Some(Assembly::new(out))
-        }
+        })
     }
 
-    pub fn get_class(&self, assembly: &Assembly, name: impl std::fmt::Display) -> Option<Class> {
+    pub fn get_class(&self, assembly: &Assembly, name: impl std::fmt::Display) -> Result<Option<Class>> {
         let mut name = name.to_string();
         if !name.starts_with('\0') {
             name.push('\0');
         }
-        // TODO: Error handling
         let mut out: *const c_void = std::ptr::null();
-        unsafe { (self.get_class)(assembly.as_ptr(), name.as_ptr().cast(), &raw mut out) };
+        let mut err: i32 = -1;
+        unsafe { (self.get_class)(assembly.as_ptr(), name.as_ptr().cast(), &raw mut out, &raw mut err) };
+        if err > 0 { return Err(Error::from(err)); }
 
-        if out.is_null() {
+        Ok(if out.is_null() {
             None
         } else {
             Some(Class::new(out, self.destroy))
-        }
+        })
     }
 
-    pub fn new_object(&self, class: &Class) -> Option<Object> {
-        // TODO: Error handling
+    pub fn new_object(&self, class: &Class) -> Result<Option<Object>> {
         let mut out: *const c_void = std::ptr::null();
-        unsafe { (self.new)(class.as_ptr(), &raw mut out) };
+        let mut err: i32 = -1;
+        unsafe { (self.new)(class.as_ptr(), &raw mut out, &raw mut err) };
+        if err > 0 { return Err(Error::from(err)); }
 
-        if out.is_null() {
+        Ok(if out.is_null() {
             None
         } else {
             Some(Object {
@@ -499,14 +547,15 @@ impl RuntimeLibrary {
                 destroy: self.destroy,
                 free: self.free,
             })
-        }
+        })
     }
 
-    pub fn is_assignable_from(&self, base: &Class, target: &Class) -> bool {
-        // TODO: Error handling
+    pub fn is_assignable_from(&self, base: &Class, target: &Class) -> Result<bool> {
         let mut out: i32 = 0;
-        unsafe { (self.is_assignable_from)(base.as_ptr(), target.as_ptr(), &raw mut out) };
-        out == 1
+        let mut err: i32 = -1;
+        unsafe { (self.is_assignable_from)(base.as_ptr(), target.as_ptr(), &raw mut out, &raw mut err) };
+        if err > 0 { return Err(Error::from(err)); }
+        Ok(out == 1)
     }
 
     pub fn get_method(
@@ -514,34 +563,36 @@ impl RuntimeLibrary {
         class: &Class,
         name: impl std::fmt::Display,
         args: i32,
-    ) -> Option<Method> {
+    ) -> Result<Option<Method>> {
         let mut name = name.to_string();
         if !name.starts_with('\0') {
             name.push('\0');
         }
-        // TODO: Error handling
         let mut out: *const c_void = std::ptr::null();
-        unsafe { (self.get_method)(class.as_ptr(), name.as_ptr().cast(), args, &raw mut out) };
+        let mut err: i32 = -1;
+        unsafe { (self.get_method)(class.as_ptr(), name.as_ptr().cast(), args, &raw mut out, &raw mut err) };
+        if err > 0 { return Err(Error::from(err)); }
 
-        if out.is_null() {
+        Ok(if out.is_null() {
             None
         } else {
             Some(Method::new(out, self.destroy))
-        }
+        })
     }
 
-    pub fn get_meta_data(&self, class: &Class) -> serde_json::Result<MetaData> {
-        // TODO: Error handling
+    pub fn get_meta_data(&self, class: &Class) -> Result<MetaData> {
         let mut out: *const c_void = std::ptr::null();
-        unsafe { (self.get_meta_data)(class.as_ptr(), &raw mut out) };
+        let mut err: i32 = -1;
+        unsafe { (self.get_meta_data)(class.as_ptr(), &raw mut out, &raw mut err) };
+        if err > 0 { return Err(Error::from(err)); }
 
         if !out.is_null() {
             let payload = unsafe { CStr::from_ptr(out.cast()) };
             let pref = payload.to_string_lossy();
-            let value = serde_json::from_str(&pref);
+            let value = serde_json::from_str(&pref)?;
             unsafe { (self.free)(out) };
 
-            return value;
+            return Ok(value);
         }
 
         Ok(Default::default())
@@ -552,24 +603,27 @@ impl RuntimeLibrary {
         instance: &Object,
         name: impl AsRef<str>,
         value: impl ManagedParam,
-    ) {
+    ) -> Result<()> {
         let mut name = name.as_ref().to_string();
         if !name.ends_with('\0') {
             name.push('\0');
         }
 
-        // TODO: Error handling
+        let mut err: i32 = -1;
         unsafe {
             (self.set_field_value)(
                 instance.as_ptr(),
                 name.as_ptr().cast(),
                 value.into_managed_param(),
+                &raw mut err,
             )
         };
+        if err > 0 { return Err(Error::from(err)); }
+        Ok(())
     }
 
-    pub fn invoke(&self, method: &Method, instance: Option<&Object>, args: &[*const c_void]) {
-        // TODO: Error handling
+    pub fn invoke(&self, method: &Method, instance: Option<&Object>, args: &[*const c_void]) -> Result<()> {
+        let mut err: i32 = -1;
         unsafe {
             (self.runtime_invoke)(
                 method.as_ptr(),
@@ -577,8 +631,11 @@ impl RuntimeLibrary {
                     .map(|v| v.as_ptr().cast())
                     .unwrap_or(std::ptr::null()),
                 args.as_ptr(),
+                &raw mut err,
             )
         };
+        if err > 0 { return Err(Error::from(err)); }
+        Ok(())
     }
 }
 
@@ -588,10 +645,10 @@ pub trait Wrapper {
 
 pub struct Scope {
     inner: *const c_void,
-    unload: Destroy,
+    unload: Unload,
 }
 impl Scope {
-    fn new(inner: *const c_void, unload: Destroy) -> Self {
+    fn new(inner: *const c_void, unload: Unload) -> Self {
         Self { inner, unload }
     }
 }
@@ -602,7 +659,8 @@ impl Wrapper for Scope {
 }
 impl Drop for Scope {
     fn drop(&mut self) {
-        unsafe { (self.unload)(self.inner) };
+        let mut err: i32 = -1;
+        unsafe { (self.unload)(self.inner, &raw mut err) };
     }
 }
 
@@ -672,74 +730,80 @@ pub struct Object {
 unsafe impl Send for Object {}
 unsafe impl Sync for Object {}
 impl Object {
-    pub fn set_field_value(&self, name: impl AsRef<str>, value: impl ManagedParam) {
+    pub fn set_field_value(&self, name: impl AsRef<str>, value: impl ManagedParam) -> Result<()> {
         let mut name = name.as_ref().to_string();
         if !name.ends_with('\0') {
             name.push('\0');
         }
 
-        // TODO: Error handling
+        let mut err: i32 = -1;
         unsafe {
-            (self.set_field_value)(self.inner, name.as_ptr().cast(), value.into_managed_param())
+            (self.set_field_value)(self.inner, name.as_ptr().cast(), value.into_managed_param(), &raw mut err)
         };
+        if err > 0 { return Err(Error::from(err)); }
+        Ok(())
     }
 
-    pub fn get_field_value<A: DeserializeOwned>(&self, name: impl AsRef<str>) -> Option<A> {
+    pub fn get_field_value<A: DeserializeOwned>(&self, name: impl AsRef<str>) -> Result<Option<A>> {
         let mut name = name.as_ref().to_string();
         if !name.ends_with('\0') {
             name.push('\0');
         }
 
-        // TODO: Error handling
         let mut out: *const c_void = std::ptr::null();
-        unsafe { (self.get_field_value)(self.inner, name.as_ptr().cast(), &raw mut out) };
+        let mut err: i32 = -1;
+        unsafe { (self.get_field_value)(self.inner, name.as_ptr().cast(), &raw mut out, &raw mut err) };
+        if err > 0 { return Err(Error::from(err)); }
 
         if out.is_null() {
-            return None;
+            return Ok(None);
         }
 
         let payload = unsafe { CStr::from_ptr(out.cast()) };
         let payload_ref = payload.to_string_lossy();
-        let value = serde_json::from_str(&payload_ref).ok();
+        let value = serde_json::from_str(&payload_ref)?;
 
         unsafe { (self.free)(out) };
 
-        value
+        Ok(Some(value))
     }
 
-    pub fn set_property_value(&self, name: impl AsRef<str>, value: impl ManagedParam) {
+    pub fn set_property_value(&self, name: impl AsRef<str>, value: impl ManagedParam) -> Result<()> {
         let mut name = name.as_ref().to_string();
         if !name.ends_with('\0') {
             name.push('\0');
         }
 
-        // TODO: Error handling
+        let mut err: i32 = -1;
         unsafe {
-            (self.set_property_value)(self.inner, name.as_ptr().cast(), value.into_managed_param())
+            (self.set_property_value)(self.inner, name.as_ptr().cast(), value.into_managed_param(), &raw mut err)
         };
+        if err > 0 { return Err(Error::from(err)); }
+        Ok(())
     }
 
-    pub fn get_property_value<A: DeserializeOwned>(&self, name: impl AsRef<str>) -> Option<A> {
+    pub fn get_property_value<A: DeserializeOwned>(&self, name: impl AsRef<str>) -> Result<Option<A>> {
         let mut name = name.as_ref().to_string();
         if !name.ends_with('\0') {
             name.push('\0');
         }
 
-        // TODO: Error handling
         let mut out: *const c_void = std::ptr::null();
-        unsafe { (self.get_property_value)(self.inner, name.as_ptr().cast(), &raw mut out) };
+        let mut err: i32 = -1;
+        unsafe { (self.get_property_value)(self.inner, name.as_ptr().cast(), &raw mut out, &raw mut err) };
+        if err > 0 { return Err(Error::from(err)); }
 
         if out.is_null() {
-            return None;
+            return Ok(None);
         }
 
         let payload = unsafe { CStr::from_ptr(out.cast()) };
         let payload_ref = payload.to_string_lossy();
-        let value = serde_json::from_str(&payload_ref).ok();
+        let value = serde_json::from_str::<A>(&payload_ref)?;
 
         unsafe { (self.free)(out) };
 
-        value
+        Ok(Some(value))
     }
 }
 impl Wrapper for Object {

@@ -583,6 +583,7 @@ dependencies = [
  "coreclr-hosting-shared",
  "dirs",
  "dunce",
+ "glob",
  "hostfxr-sys",
  "log",
  "regex",

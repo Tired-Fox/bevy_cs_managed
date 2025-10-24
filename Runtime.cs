@@ -23,6 +23,20 @@ class Property {
     public bool CanWrite { get; set; }
 }
 
+public enum Error {
+    ClassNotFound = 1,
+    MethodNotFound = 2,
+    FieldNotFound = 3,
+    PropertyNotFound = 4,
+    ReadonlyField = 5,
+    MissingGetter = 6,
+    MissingSetter = 7,
+    MissingRequiredArgument = 8,
+    PathNotFound = 9,
+    AssemblyNotLoaded = 10,
+    ClassNotRegistered = 11,
+}
+
 public sealed class Scope : AssemblyLoadContext
 {
     public readonly string BaseDir;
@@ -83,10 +97,18 @@ public class Host
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void LoadFromPathDelegate(IntPtr scopeId, IntPtr pathUtf8Z, out Assembly result);
-    public static void LoadFromPath(IntPtr scope, IntPtr path, out Assembly? result)
+    public delegate void LoadFromPathDelegate(IntPtr scopeId, IntPtr pathUtf8Z, out Assembly? result, out int error);
+    public static void LoadFromPath(IntPtr scope, IntPtr path, out Assembly? result, out int error)
     {
-        var self = Ref<Scope>(scope) ?? throw new ArgumentNullException("Scope is null");
+        result = null;
+        error = 0;
+
+        var self = Ref<Scope>(scope);
+        if (self == null) {
+            error = (int)Error.MissingRequiredArgument;
+            return;
+        }
+
         var p = Path.Combine(self.BaseDir, ReadUtf8Z(path));
         try
         {
@@ -99,12 +121,20 @@ public class Host
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void LoadFromBytesDelegate(IntPtr scopeId, IntPtr bytes, int length, out Assembly result);
-    public static void LoadFromBytes(IntPtr scope, IntPtr bytes, int length, out Assembly? result)
+    public delegate void LoadFromBytesDelegate(IntPtr scopeId, IntPtr bytes, int length, out Assembly result, out int error);
+    public static void LoadFromBytes(IntPtr scope, IntPtr bytes, int length, out Assembly? result, out int error)
     {
+        result = null;
+        error = 0;
+
         unsafe
         {
-            var self = Ref<Scope>(scope) ?? throw new ArgumentNullException("Scope is null");
+            var self = Ref<Scope>(scope);
+            if (self == null) {
+                error = (int)Error.MissingRequiredArgument;
+                return;
+            }
+
             var span = new ReadOnlySpan<byte>((void*)bytes, length);
             using var ms = new MemoryStream(span.ToArray());
             try
@@ -119,11 +149,17 @@ public class Host
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void UnloadDelegate(IntPtr scopeId);
-    public static void Unload(IntPtr scope)
+    public delegate void UnloadDelegate(IntPtr scopeId, out int error);
+    public static void Unload(IntPtr scope, out int error)
     {
+        error = 0;
+
         var handle = GCHandle.FromIntPtr(scope);
-        var target = (Scope?)handle.Target ?? throw new ArgumentNullException("Scope is null");
+        var target = (Scope?)handle.Target;
+        if (target == null) {
+            error = (int)Error.MissingRequiredArgument;
+            return;
+        }
 
         target.Unload();
         handle.Free();
@@ -134,11 +170,19 @@ public class Host
     // ----- CLASS -----
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void GetClassDelegate(Assembly assembly, IntPtr typeNameUtf8Z, out IntPtr result); // returns type handle
-    public static void GetClass(Assembly assembly, IntPtr typeNameUtf8Z, out IntPtr result)
+    public delegate void GetClassDelegate(Assembly assembly, IntPtr typeNameUtf8Z, out IntPtr result, out int error); // returns type handle
+    public static void GetClass(Assembly assembly, IntPtr typeNameUtf8Z, out IntPtr result, out int error)
     {
+        result = IntPtr.Zero;
+        error = 0;
+
         var tn = ReadUtf8Z(typeNameUtf8Z);
-        var t = ResolveTypeInAsm(assembly, tn) ?? throw new TypeLoadException($"Type not found: {tn}");
+        var t = ResolveTypeInAsm(assembly, tn);
+        if (t == null) {
+            error = (int)Error.ClassNotFound;
+            return;
+        }
+
         if (t == null) {
             result = IntPtr.Zero;
         } else {
@@ -158,28 +202,59 @@ public class Host
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void NewDelegate(IntPtr klass, out IntPtr result);
-    public static void New(IntPtr klass, out IntPtr result)
+    public delegate void NewDelegate(IntPtr klass, out IntPtr result, out int error);
+    public static void New(IntPtr klass, out IntPtr result, out int error)
     {
-        var t = Ref<Type>(klass) ?? throw new ArgumentNullException("Class is null");
-        var obj = Activator.CreateInstance(t) ?? throw new MissingMethodException($"No default ctor for {t.FullName}");
+        result = IntPtr.Zero;
+        error = 0;
+
+        var t = Ref<Type>(klass);
+        if (t == null) {
+            error = (int)Error.MissingRequiredArgument;
+            return;
+        }
+
+        var obj = Activator.CreateInstance(t);
+        if (obj == null) {
+            error = (int)Error.MethodNotFound;
+            return;
+        }
+
         result = Pin(obj);
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void IsAssignableFromDelegate(IntPtr baseKlass, IntPtr targetKlass, out int result);
-    public static void IsAssignableFrom(IntPtr baseKlass, IntPtr targetKlass, out int result)
+    public delegate void IsAssignableFromDelegate(IntPtr baseKlass, IntPtr targetKlass, out int result, out int error);
+    public static void IsAssignableFrom(IntPtr baseKlass, IntPtr targetKlass, out int result, out int error)
     {
-        var baseType = Ref<Type>(baseKlass) ?? throw new ArgumentNullException("Base class is null");
-        var targetType = Ref<Type>(targetKlass) ?? throw new ArgumentNullException("Target class is null");
+        result = 0;
+        error = 0;
+
+        var baseType = Ref<Type>(baseKlass);
+        if (baseType == null) {
+            error = (int)Error.MissingRequiredArgument;
+            return;
+        }
+        var targetType = Ref<Type>(targetKlass);
+        if (targetType == null) {
+            error = (int)Error.MissingRequiredArgument;
+            return;
+        }
         result = baseType.IsAssignableFrom(targetType) ? 1 : 0;
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void GetMetaDataDelegate(IntPtr klass, out IntPtr result);
-    public static void GetMetaData(IntPtr klass, out IntPtr result)
+    public delegate void GetMetaDataDelegate(IntPtr klass, out IntPtr result, out int error);
+    public static void GetMetaData(IntPtr klass, out IntPtr result, out int error)
     {
-        var t = Ref<Type>(klass) ?? throw new ArgumentNullException("Class is null");
+        result = IntPtr.Zero;
+        error = 0;
+
+        var t = Ref<Type>(klass);
+        if (t == null) {
+            error = (int)Error.MissingRequiredArgument;
+            return;
+        }
 
         var fields = t.GetFields()
             .Select(f => new Field {
@@ -217,10 +292,17 @@ public class Host
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate void GetMethodDelegate(IntPtr klass, IntPtr nameUtf8Z, int argCount, out IntPtr result);
-    public static void GetMethod(IntPtr klass, IntPtr name, int argCount, out IntPtr result)
+    public delegate void GetMethodDelegate(IntPtr klass, IntPtr nameUtf8Z, int argCount, out IntPtr result, out int error);
+    public static void GetMethod(IntPtr klass, IntPtr name, int argCount, out IntPtr result, out int error)
     {
-        var t = Ref<Type>(klass) ?? throw new ArgumentNullException("Class is null");
+        result = IntPtr.Zero;
+        error = 0;
+
+        var t = Ref<Type>(klass);
+        if (t == null) {
+            error = (int)Error.MissingRequiredArgument;
+            return;
+        }
         var methodName = ReadUtf8Z(name);
 
         var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance;
@@ -230,16 +312,28 @@ public class Host
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public unsafe delegate void SetFieldValueDelegate(IntPtr instance, IntPtr name, void* value);
-    public unsafe static void SetFieldValue(IntPtr instance, IntPtr name, void* value)
+    public unsafe delegate void SetFieldValueDelegate(IntPtr instance, IntPtr name, void* value, out int error);
+    public unsafe static void SetFieldValue(IntPtr instance, IntPtr name, void* value, out int error)
     {
-        var target = Ref<object>(instance) ?? throw new ArgumentNullException();
+        error = 0;
+
+        var target = Ref<object>(instance);
+        if (target == null) {
+            error = (int)Error.MissingRequiredArgument;
+            return;
+        }
         var fieldName = ReadUtf8Z(name);
         var flags = BindingFlags.Instance | BindingFlags.Public;
 
-        var fi = target.GetType().GetField(fieldName, flags) ?? throw new Exception("Field not found");
+        var fi = target.GetType().GetField(fieldName, flags);
+        if (fi == null) {
+            error = (int)Error.FieldNotFound;
+            return;
+        }
+
         if ((fi.Attributes & FieldAttributes.InitOnly) != 0) {
-            throw new Exception("Field not found");
+            error = (int)Error.ReadonlyField;
+            return;
         }
 
         var fv = ReadValueAsObject(value, fi.FieldType);
@@ -251,14 +345,25 @@ public class Host
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public unsafe delegate void GetFieldValueDelegate(IntPtr instance, IntPtr name, out IntPtr result);
-    public unsafe static void GetFieldValue(IntPtr instance, IntPtr name, out IntPtr result)
+    public unsafe delegate void GetFieldValueDelegate(IntPtr instance, IntPtr name, out IntPtr result, out int error);
+    public unsafe static void GetFieldValue(IntPtr instance, IntPtr name, out IntPtr result, out int error)
     {
-        var target = Ref<object>(instance) ?? throw new ArgumentNullException();
+        result = IntPtr.Zero;
+        error = 0;
+
+        var target = Ref<object>(instance);
+        if (target == null) {
+            error = (int)Error.MissingRequiredArgument;
+            return;
+        }
         var fieldName = ReadUtf8Z(name);
         var flags = BindingFlags.Instance | BindingFlags.Public;
 
-        var fi = target.GetType().GetField(fieldName, flags) ?? throw new Exception("Property not found");
+        var fi = target.GetType().GetField(fieldName, flags);
+        if (fi == null) {
+            error = (int)Error.FieldNotFound;
+            return;
+        }
         var value = fi.GetValue(target);
 
         var options = new JsonSerializerOptions { IncludeFields = true };
@@ -272,34 +377,29 @@ public class Host
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public unsafe delegate void SetFieldValueUncheckedDelegate(IntPtr instance, IntPtr name, void* value);
-    public unsafe static void SetFieldValueUnchecked(IntPtr instance, IntPtr name, void* value)
+    public unsafe delegate void SetPropertyValueDelegate(IntPtr instance, IntPtr name, void* value, out int error);
+    public unsafe static void SetPropertyValue(IntPtr instance, IntPtr name, void* value, out int error)
     {
-        var target = Ref<object>(instance) ?? throw new ArgumentNullException();
-        var fieldName = ReadUtf8Z(name);
-        var flags = BindingFlags.Instance | BindingFlags.Public;
+        error = 0;
 
-        var fi = target.GetType().GetField(fieldName, flags) ?? throw new Exception("Field not found");
-
-        var fv = ReadValueAsObject(value, fi.FieldType);
-        if (fi.IsStatic) {
-            fi.SetValue(null, fv);
-        } else {
-            fi.SetValue(target, fv);
+        var target = Ref<object>(instance);
+        if (target == null) {
+            error = (int)Error.MissingRequiredArgument;
+            return;
         }
-    }
-
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public unsafe delegate void SetPropertyValueDelegate(IntPtr instance, IntPtr name, void* value);
-    public unsafe static void SetPropertyValue(IntPtr instance, IntPtr name, void* value)
-    {
-        var target = Ref<object>(instance) ?? throw new ArgumentNullException();
         var propertyName = ReadUtf8Z(name);
         var flags = BindingFlags.Instance | BindingFlags.Public;
 
-        var fi = target.GetType().GetProperty(propertyName, flags) ?? throw new Exception("Property not found");
-        if (!fi.CanWrite)
-            throw new ArgumentException("Property doesn't have a setter");
+        var fi = target.GetType().GetProperty(propertyName, flags);
+        if (fi == null) {
+            error = (int)Error.PropertyNotFound;
+            return;
+        }
+
+        if (!fi.CanWrite) {
+            error = (int)Error.MissingSetter;
+            return;
+        }
 
         bool isStatic = (fi.GetGetMethod(true)?.IsStatic ?? false) ||
             (fi.GetSetMethod(true)?.IsStatic ?? false);
@@ -313,16 +413,30 @@ public class Host
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public unsafe delegate void GetPropertyValueDelegate(IntPtr instance, IntPtr name, out IntPtr result);
-    public unsafe static void GetPropertyValue(IntPtr instance, IntPtr name, out IntPtr result)
+    public unsafe delegate void GetPropertyValueDelegate(IntPtr instance, IntPtr name, out IntPtr result, out int error);
+    public unsafe static void GetPropertyValue(IntPtr instance, IntPtr name, out IntPtr result, out int error)
     {
-        var target = Ref<object>(instance) ?? throw new ArgumentNullException();
+        result = IntPtr.Zero;
+        error = 0;
+
+        var target = Ref<object>(instance);
+        if (target == null) {
+            error = (int)Error.MissingRequiredArgument;
+            return;
+        }
         var fieldName = ReadUtf8Z(name);
         var flags = BindingFlags.Instance | BindingFlags.Public;
 
-        var fi = target.GetType().GetProperty(fieldName, flags) ?? throw new Exception("Property not found");
-        if (!fi.CanRead)
-            throw new ArgumentException("Property doesn't have a setter");
+        var fi = target.GetType().GetProperty(fieldName, flags);
+        if (fi == null) {
+            error = (int)Error.PropertyNotFound;
+            return;
+        }
+
+        if (!fi.CanRead) {
+            error = (int)Error.MissingGetter;
+            return;
+        }
 
         var value = fi.GetValue(target);
 
@@ -339,10 +453,16 @@ public class Host
     // ----- METHOD -----
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public unsafe delegate void RuntimeInvokeDelegate(IntPtr method, void* instance, void** args);
-    public unsafe static void RuntimeInvoke(IntPtr method, void* instancePtr, void** argv)
+    public unsafe delegate void RuntimeInvokeDelegate(IntPtr method, void* instance, void** args, out int error);
+    public unsafe static void RuntimeInvoke(IntPtr method, void* instancePtr, void** argv, out int error)
     {
-        var m = Ref<MethodInfo>(method) ?? throw new ArgumentNullException("Method is null");
+        error = 0;
+
+        var m = Ref<MethodInfo>(method);
+        if (m == null) {
+            error = (int)Error.MissingRequiredArgument;
+            return;
+        }
         var parameters = m.GetParameters();
         var argc = parameters.Length;
 

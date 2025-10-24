@@ -23,9 +23,9 @@ pub fn awake(world: DeferredWorld, context: HookContext) {
     let Some(runtime) = world.get_resource::<Runtime>() else { return };
     //┌─ Lookup the Awake method that has 0 arguments
     //┆ Note: This will cache the method if found for future calls
-    //└──────────────────────────────────────────┬────────┐
-    let Some(awake) = runtime.get_method(script, "Awake", 0) else { return };
-    awake.invoke(());
+    //└──────────────────────────────────────────────┬────────┐
+    let Ok(Some(awake)) = runtime.get_method(script, "Awake", 0) else { return };
+    awake.invoke(()).unwrap();
 }
 
 fn setup_scripts(world: &mut World) {
@@ -35,19 +35,14 @@ fn setup_scripts(world: &mut World) {
 }
 
 fn spawn_scripts(mut commands: Commands, mut runtime: ResMut<Runtime>) {
-    //┌─This is the fullname including namespace [namespace.]ClassName
-    //┆  The below example can be referenced with `Scripts.Creatures.Player`
+    //┌─This is the fullname of the desired scripts class.
+    //┆  The scripts class is resolved by matching a global namespace class with the same name as the file.
     //┆
+    //┆  // Player.cs
     //┆  using Engine;
-    //┆  namespace Scripts
+    //┆  class Player
     //┆  {
-    //┆      namespace Creatures
-    //┆      {
-    //┆          class Player
-    //┆          {
-    //┆             public Vector3 Position;
-    //┆          }
-    //┆      }
+    //┆     public Vector3 Position;
     //┆  }
     //└─────────────────────────┐
     let script = runtime.create("Player").unwrap();
@@ -61,7 +56,7 @@ fn spawn_scripts(mut commands: Commands, mut runtime: ResMut<Runtime>) {
     //┆┆    the expected type in the C# method parameter
     //┆└──────────────────────────────────┐
     //└────┐                              │
-    script.set_property_value("Position", &Vector3 { x: 1.2, y: 2.4, z: 3.6 });
+    script.set_property_value("Position", &Vector3 { x: 1.2, y: 2.4, z: 3.6 }).unwrap();
 
     println!("Player {{");
     // MetaData, fields and properties, are cached when the class type is loaded and
@@ -91,9 +86,9 @@ fn update(
         //┆ When invoked the arguments can be passed as a single value reference if there is 1 arg
         //┆     or as a tuple of value references for multiple args.
         //┆
-        //└──────────────────────────────────────────────┬─────────┐
-        if let Some(update) = runtime.get_method(script, "Update", 1) {
-            update.invoke(&dt);
+        //└──────────────────────────────────────────────────┬─────────┐
+        if let Ok(Some(update)) = runtime.get_method(script, "Update", 1) {
+            update.invoke(&dt).unwrap();
         }
     }
 }
